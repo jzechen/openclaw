@@ -1,4 +1,10 @@
-import { resolveDefaultAgentId } from "../../agents/agent-scope.js";
+import {
+  buildAuthHealthSummary,
+  DEFAULT_OAUTH_WARN_MS,
+  type AuthProviderHealthStatus,
+} from "../../agents/auth-health.js";
+import { ensureAuthProfileStore } from "../../agents/auth-profiles.js";
+import { resolveAgentDir, resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import { loadConfig } from "../../config/config.js";
 import { getMemorySearchManager } from "../../memory/index.js";
 import { formatError } from "../server-utils.js";
@@ -13,7 +19,54 @@ export type DoctorMemoryStatusPayload = {
   };
 };
 
+export type DoctorAuthProviderStatusPayload = {
+  provider: string;
+  status: AuthProviderHealthStatus;
+  profileCount: number;
+  expiresAt?: number;
+  remainingMs?: number;
+};
+
+export type DoctorAuthStatusPayload = {
+  agentId: string;
+  now: number;
+  warnAfterMs: number;
+  providers: DoctorAuthProviderStatusPayload[];
+  error?: string;
+};
+
 export const doctorHandlers: GatewayRequestHandlers = {
+  "doctor.auth.status": async ({ respond }) => {
+    const cfg = loadConfig();
+    const agentId = resolveDefaultAgentId(cfg);
+    try {
+      const agentDir = resolveAgentDir(cfg, agentId);
+      const store = ensureAuthProfileStore(agentDir, { allowKeychainPrompt: false });
+      const summary = buildAuthHealthSummary({ cfg, store });
+      const payload: DoctorAuthStatusPayload = {
+        agentId,
+        now: summary.now,
+        warnAfterMs: summary.warnAfterMs,
+        providers: summary.providers.map((provider) => ({
+          provider: provider.provider,
+          status: provider.status,
+          profileCount: provider.profiles.length,
+          expiresAt: provider.expiresAt,
+          remainingMs: provider.remainingMs,
+        })),
+      };
+      respond(true, payload, undefined);
+    } catch (err) {
+      const payload: DoctorAuthStatusPayload = {
+        agentId,
+        now: Date.now(),
+        warnAfterMs: DEFAULT_OAUTH_WARN_MS,
+        providers: [],
+        error: `gateway auth probe failed: ${formatError(err)}`,
+      };
+      respond(true, payload, undefined);
+    }
+  },
   "doctor.memory.status": async ({ respond }) => {
     const cfg = loadConfig();
     const agentId = resolveDefaultAgentId(cfg);

@@ -17,6 +17,7 @@ import type {
   ChannelsStatusSnapshot,
   ConfigSnapshot,
   ConfigUiHints,
+  DoctorAuthStatusSnapshot,
   HealthSnapshot,
   LogEntry,
   LogLevel,
@@ -132,6 +133,9 @@ export type AppViewState = {
   toolsCatalogLoading: boolean;
   toolsCatalogError: string | null;
   toolsCatalogResult: ToolsCatalogResult | null;
+  agentsAuthStatusLoading: boolean;
+  agentsAuthStatusError: string | null;
+  agentsAuthStatus: DoctorAuthStatusSnapshot | null;
   agentsPanel: "overview" | "files" | "tools" | "skills" | "channels" | "cron";
   agentFilesLoading: boolean;
   agentFilesError: string | null;

@@ -1,5 +1,5 @@
 import type { GatewayBrowserClient } from "../gateway.ts";
-import type { AgentsListResult, ToolsCatalogResult } from "../types.ts";
+import type { AgentsListResult, DoctorAuthStatusSnapshot, ToolsCatalogResult } from "../types.ts";
 import { saveConfig } from "./config.ts";
 import type { ConfigState } from "./config.ts";
 
@@ -13,6 +13,9 @@ export type AgentsState = {
   toolsCatalogLoading: boolean;
   toolsCatalogError: string | null;
   toolsCatalogResult: ToolsCatalogResult | null;
+  agentsAuthStatusLoading: boolean;
+  agentsAuthStatusError: string | null;
+  agentsAuthStatus: DoctorAuthStatusSnapshot | null;
 };
 
 export type AgentsConfigSaveState = AgentsState & ConfigState;
@@ -64,6 +67,27 @@ export async function loadToolsCatalog(state: AgentsState, agentId?: string | nu
     state.toolsCatalogError = String(err);
   } finally {
     state.toolsCatalogLoading = false;
+  }
+}
+
+export async function loadAgentAuthStatus(state: AgentsState) {
+  if (!state.client || !state.connected) {
+    return;
+  }
+  if (state.agentsAuthStatusLoading) {
+    return;
+  }
+  state.agentsAuthStatusLoading = true;
+  state.agentsAuthStatusError = null;
+  try {
+    const res = await state.client.request<DoctorAuthStatusSnapshot>("doctor.auth.status", {});
+    if (res) {
+      state.agentsAuthStatus = res;
+    }
+  } catch (err) {
+    state.agentsAuthStatusError = String(err);
+  } finally {
+    state.agentsAuthStatusLoading = false;
   }
 }
 

@@ -288,7 +288,24 @@ export type ConfigSnapshot = {
   parsed?: unknown;
   valid?: boolean | null;
   config?: Record<string, unknown> | null;
+  resolved?: Record<string, unknown> | null;
   issues?: ConfigSnapshotIssue[] | null;
+};
+
+export type DoctorAuthProviderStatus = {
+  provider: string;
+  status: "ok" | "expiring" | "expired" | "missing" | "static";
+  profileCount: number;
+  expiresAt?: number | null;
+  remainingMs?: number | null;
+};
+
+export type DoctorAuthStatusSnapshot = {
+  agentId: string;
+  now: number;
+  warnAfterMs: number;
+  providers: DoctorAuthProviderStatus[];
+  error?: string | null;
 };
 
 export type ConfigSchemaResponse = {

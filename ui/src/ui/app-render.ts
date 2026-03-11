@@ -8,7 +8,12 @@ import type { AppViewState } from "./app-view-state.ts";
 import { loadAgentFileContent, loadAgentFiles, saveAgentFile } from "./controllers/agent-files.ts";
 import { loadAgentIdentities, loadAgentIdentity } from "./controllers/agent-identity.ts";
 import { loadAgentSkills } from "./controllers/agent-skills.ts";
-import { loadAgents, loadToolsCatalog, saveAgentsConfig } from "./controllers/agents.ts";
+import {
+  loadAgentAuthStatus,
+  loadAgents,
+  loadToolsCatalog,
+  saveAgentsConfig,
+} from "./controllers/agents.ts";
 import { loadChannels } from "./controllers/channels.ts";
 import { loadChatHistory } from "./controllers/chat.ts";
 import {
@@ -558,6 +563,8 @@ export function renderApp(state: AppViewState) {
                 selectedAgentId: resolvedAgentId,
                 activePanel: state.agentsPanel,
                 configForm: configValue,
+                configResolved:
+                  (state.configSnapshot?.resolved as Record<string, unknown> | null) ?? null,
                 configLoading: state.configLoading,
                 configSaving: state.configSaving,
                 configDirty: state.configFormDirty,
@@ -586,6 +593,7 @@ export function renderApp(state: AppViewState) {
                 toolsCatalogLoading: state.toolsCatalogLoading,
                 toolsCatalogError: state.toolsCatalogError,
                 toolsCatalogResult: state.toolsCatalogResult,
+                agentsAuthStatus: state.agentsAuthStatus,
                 skillsFilter: state.skillsFilter,
                 onRefresh: async () => {
                   await loadAgents(state);
@@ -595,6 +603,7 @@ export function renderApp(state: AppViewState) {
                     state.agentsList?.agents?.[0]?.id ??
                     null;
                   await loadToolsCatalog(state, nextSelected);
+                  await loadAgentAuthStatus(state);
                   const agentIds = state.agentsList?.agents?.map((entry) => entry.id) ?? [];
                   if (agentIds.length > 0) {
                     void loadAgentIdentities(state, agentIds);
@@ -711,8 +720,13 @@ export function renderApp(state: AppViewState) {
                     removeConfigFormValue(state, [...basePath, "deny"]);
                   }
                 },
-                onConfigReload: () => loadConfig(state),
-                onConfigSave: () => saveAgentsConfig(state),
+                onConfigReload: () => Promise.all([loadConfig(state), loadAgentAuthStatus(state)]),
+                onConfigSave: async () => {
+                  await saveAgentsConfig(state);
+                  await loadAgentAuthStatus(state);
+                },
+                onSetConfigValue: (path, value) => updateConfigFormValue(state, path, value),
+                onRemoveConfigValue: (path) => removeConfigFormValue(state, path),
                 onChannelsRefresh: () => loadChannels(state, false),
                 onCronRefresh: () => state.loadCron(),
                 onSkillsFilterChange: (next) => (state.skillsFilter = next),

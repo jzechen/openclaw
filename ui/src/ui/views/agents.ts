@@ -6,9 +6,13 @@ import type {
   ChannelsStatusSnapshot,
   CronJob,
   CronStatus,
+  DoctorAuthStatusSnapshot,
   SkillStatusReport,
   ToolsCatalogResult,
 } from "../types.ts";
+import { renderLlmConfigPanel } from "./agents-llm-config.ts";
+import type { AgentLlmCatalog, AgentLlmOption } from "./agents-llm.ts";
+import { resolveAgentLlmCatalog } from "./agents-llm.ts";
 import {
   renderAgentFiles,
   renderAgentChannels,
@@ -18,10 +22,8 @@ import { renderAgentTools, renderAgentSkills } from "./agents-panels-tools-skill
 import {
   agentBadgeText,
   buildAgentContext,
-  buildModelOptions,
   normalizeAgentLabel,
   normalizeModelValue,
-  parseFallbackList,
   resolveAgentConfig,
   resolveAgentEmoji,
   resolveEffectiveModelFallbacks,
@@ -38,6 +40,7 @@ export type AgentsProps = {
   selectedAgentId: string | null;
   activePanel: AgentsPanel;
   configForm: Record<string, unknown> | null;
+  configResolved: Record<string, unknown> | null;
   configLoading: boolean;
   configSaving: boolean;
   configDirty: boolean;
@@ -66,6 +69,7 @@ export type AgentsProps = {
   toolsCatalogLoading: boolean;
   toolsCatalogError: string | null;
   toolsCatalogResult: ToolsCatalogResult | null;
+  agentsAuthStatus: DoctorAuthStatusSnapshot | null;
   skillsFilter: string;
   onRefresh: () => void;
   onSelectAgent: (agentId: string) => void;
@@ -79,6 +83,8 @@ export type AgentsProps = {
   onToolsOverridesChange: (agentId: string, alsoAllow: string[], deny: string[]) => void;
   onConfigReload: () => void;
   onConfigSave: () => void;
+  onSetConfigValue: (path: Array<string | number>, value: unknown) => void;
+  onRemoveConfigValue: (path: Array<string | number>) => void;
   onModelChange: (agentId: string, modelId: string | null) => void;
   onModelFallbacksChange: (agentId: string, fallbacks: string[]) => void;
   onChannelsRefresh: () => void;
@@ -173,6 +179,7 @@ export function renderAgents(props: AgentsProps) {
                         agent: selectedAgent,
                         defaultId,
                         configForm: props.configForm,
+                        configResolved: props.configResolved,
                         agentFilesList: props.agentFilesList,
                         agentIdentity: props.agentIdentityById[selectedAgent.id] ?? null,
                         agentIdentityError: props.agentIdentityError,
@@ -180,8 +187,11 @@ export function renderAgents(props: AgentsProps) {
                         configLoading: props.configLoading,
                         configSaving: props.configSaving,
                         configDirty: props.configDirty,
+                        agentsAuthStatus: props.agentsAuthStatus,
                         onConfigReload: props.onConfigReload,
                         onConfigSave: props.onConfigSave,
+                        onSetConfigValue: props.onSetConfigValue,
+                        onRemoveConfigValue: props.onRemoveConfigValue,
                         onModelChange: props.onModelChange,
                         onModelFallbacksChange: props.onModelFallbacksChange,
                       })
@@ -344,10 +354,55 @@ function renderAgentTabs(active: AgentsPanel, onSelect: (panel: AgentsPanel) => 
   `;
 }
 
+function renderModelOptionGroups(catalog: AgentLlmCatalog) {
+  return [
+    ...catalog.ungrouped.map(
+      (option) => html`<option value=${option.value}>${option.label}</option>`,
+    ),
+    ...catalog.grouped.map(
+      (group) => html`
+        <optgroup label=${group.provider}>
+          ${group.options.map(
+            (option) => html`<option value=${option.value}>${option.label}</option>`,
+          )}
+        </optgroup>
+      `,
+    ),
+  ];
+}
+
+function resolveFallbackOptionValues(catalog: AgentLlmCatalog, fallback: string): AgentLlmOption[] {
+  if (!fallback.trim()) {
+    return catalog.options;
+  }
+  if (catalog.options.some((option) => option.value === fallback)) {
+    return catalog.options;
+  }
+  return [{ value: fallback, label: fallback, provider: null }, ...catalog.options];
+}
+
+function resolveNextFallbackCandidate(
+  catalog: AgentLlmCatalog,
+  effectivePrimary: string | null,
+  currentFallbacks: string[],
+): string | null {
+  for (const option of catalog.options) {
+    if (option.value === effectivePrimary) {
+      continue;
+    }
+    if (currentFallbacks.includes(option.value)) {
+      continue;
+    }
+    return option.value;
+  }
+  return null;
+}
+
 function renderAgentOverview(params: {
   agent: AgentsListResult["agents"][number];
   defaultId: string | null;
   configForm: Record<string, unknown> | null;
+  configResolved: Record<string, unknown> | null;
   agentFilesList: AgentsFilesListResult | null;
   agentIdentity: AgentIdentityResult | null;
   agentIdentityLoading: boolean;
@@ -355,14 +410,18 @@ function renderAgentOverview(params: {
   configLoading: boolean;
   configSaving: boolean;
   configDirty: boolean;
+  agentsAuthStatus: DoctorAuthStatusSnapshot | null;
   onConfigReload: () => void;
   onConfigSave: () => void;
+  onSetConfigValue: (path: Array<string | number>, value: unknown) => void;
+  onRemoveConfigValue: (path: Array<string | number>) => void;
   onModelChange: (agentId: string, modelId: string | null) => void;
   onModelFallbacksChange: (agentId: string, fallbacks: string[]) => void;
 }) {
   const {
     agent,
     configForm,
+    configResolved,
     agentFilesList,
     agentIdentity,
     agentIdentityLoading,
@@ -370,8 +429,11 @@ function renderAgentOverview(params: {
     configLoading,
     configSaving,
     configDirty,
+    agentsAuthStatus,
     onConfigReload,
     onConfigSave,
+    onSetConfigValue,
+    onRemoveConfigValue,
     onModelChange,
     onModelFallbacksChange,
   } = params;
@@ -394,7 +456,16 @@ function renderAgentOverview(params: {
     config.entry?.model,
     config.defaults?.model,
   );
-  const fallbackText = modelFallbacks ? modelFallbacks.join(", ") : "";
+  const fallbackValues = modelFallbacks ? [...modelFallbacks] : [];
+  const llmCatalog = resolveAgentLlmCatalog(configForm, [
+    ...(effectivePrimary ? [effectivePrimary] : []),
+    ...fallbackValues,
+  ]);
+  const nextFallbackCandidate = resolveNextFallbackCandidate(
+    llmCatalog,
+    effectivePrimary,
+    fallbackValues,
+  );
   const identityName =
     agentIdentity?.name?.trim() ||
     agent.identity?.name?.trim() ||
@@ -445,8 +516,8 @@ function renderAgentOverview(params: {
       </div>
 
       <div class="agent-model-select" style="margin-top: 20px;">
-        <div class="label">Model Selection</div>
-        <div class="row" style="gap: 12px; flex-wrap: wrap;">
+        <div class="label">LLM Configuration</div>
+        <div class="row" style="gap: 12px; flex-wrap: wrap; align-items: flex-start;">
           <label class="field" style="min-width: 260px; flex: 1;">
             <span>Primary model${isDefault ? " (default)" : ""}</span>
             <select
@@ -464,22 +535,73 @@ function renderAgentOverview(params: {
                       </option>
                     `
               }
-              ${buildModelOptions(configForm, effectivePrimary ?? undefined)}
+              ${
+                llmCatalog.options.length === 0
+                  ? html`
+                      <option value="" disabled>No configured models</option>
+                    `
+                  : renderModelOptionGroups(llmCatalog)
+              }
             </select>
           </label>
-          <label class="field" style="min-width: 260px; flex: 1;">
-            <span>Fallbacks (comma-separated)</span>
-            <input
-              .value=${fallbackText}
-              ?disabled=${!configForm || configLoading || configSaving}
-              placeholder="provider/model, provider/model"
-              @input=${(e: Event) =>
-                onModelFallbacksChange(
-                  agent.id,
-                  parseFallbackList((e.target as HTMLInputElement).value),
-                )}
-            />
-          </label>
+          <div class="agent-llm-fallbacks" style="min-width: 280px; flex: 1;">
+            <div class="row" style="justify-content: space-between; gap: 8px; align-items: center;">
+              <span class="label" style="margin: 0;">Fallback models</span>
+              <button
+                class="btn btn--sm"
+                ?disabled=${!nextFallbackCandidate || !configForm || configLoading || configSaving}
+                @click=${() => {
+                  if (!nextFallbackCandidate) {
+                    return;
+                  }
+                  onModelFallbacksChange(agent.id, [...fallbackValues, nextFallbackCandidate]);
+                }}
+              >
+                Add fallback
+              </button>
+            </div>
+            ${
+              fallbackValues.length === 0
+                ? html`
+                    <div class="agent-llm-empty muted">No fallback models configured.</div>
+                  `
+                : fallbackValues.map((fallback, index) => {
+                    const options = resolveFallbackOptionValues(llmCatalog, fallback);
+                    return html`
+                      <div class="agent-llm-fallback-row">
+                        <label class="field" style="flex: 1;">
+                          <span>Fallback ${index + 1}</span>
+                          <select
+                            .value=${fallback}
+                            ?disabled=${!configForm || configLoading || configSaving}
+                            @change=${(e: Event) => {
+                              const next = [...fallbackValues];
+                              next[index] = (e.target as HTMLSelectElement).value.trim();
+                              onModelFallbacksChange(agent.id, next.filter(Boolean));
+                            }}
+                          >
+                            ${options.map(
+                              (option) =>
+                                html`<option value=${option.value}>${option.label}</option>`,
+                            )}
+                          </select>
+                        </label>
+                        <button
+                          class="btn btn--sm danger"
+                          ?disabled=${!configForm || configLoading || configSaving}
+                          @click=${() =>
+                            onModelFallbacksChange(
+                              agent.id,
+                              fallbackValues.filter((_, fallbackIndex) => fallbackIndex !== index),
+                            )}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    `;
+                  })
+            }
+          </div>
         </div>
         <div class="row" style="justify-content: flex-end; gap: 8px;">
           <button class="btn btn--sm" ?disabled=${configLoading} @click=${onConfigReload}>
@@ -495,5 +617,14 @@ function renderAgentOverview(params: {
         </div>
       </div>
     </section>
+    ${renderLlmConfigPanel({
+      configForm,
+      configResolved,
+      authStatus: agentsAuthStatus,
+      configLoading,
+      configSaving,
+      onSetConfigValue,
+      onRemoveConfigValue,
+    })}
   `;
 }
