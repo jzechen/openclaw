@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { loadAgents, loadToolsCatalog, saveAgentsConfig } from "./agents.ts";
+import { loadAgentAuthStatus, loadAgents, loadToolsCatalog, saveAgentsConfig } from "./agents.ts";
 import type { AgentsConfigSaveState, AgentsState } from "./agents.ts";
 
 function createState(): { state: AgentsState; request: ReturnType<typeof vi.fn> } {
@@ -16,6 +16,9 @@ function createState(): { state: AgentsState; request: ReturnType<typeof vi.fn> 
     toolsCatalogLoading: false,
     toolsCatalogError: null,
     toolsCatalogResult: null,
+    agentsAuthStatusLoading: false,
+    agentsAuthStatusError: null,
+    agentsAuthStatus: null,
   };
   return { state, request };
 }
@@ -148,6 +151,37 @@ describe("loadToolsCatalog", () => {
     expect(state.toolsCatalogResult).toBeNull();
     expect(state.toolsCatalogError).toContain("gateway unavailable");
     expect(state.toolsCatalogLoading).toBe(false);
+  });
+});
+
+describe("loadAgentAuthStatus", () => {
+  it("loads auth health snapshot and stores result", async () => {
+    const { state, request } = createState();
+    const payload = {
+      agentId: "main",
+      now: 1_700_000_000_000,
+      warnAfterMs: 86_400_000,
+      providers: [{ provider: "zai", status: "static", profileCount: 1 }],
+    };
+    request.mockResolvedValue(payload);
+
+    await loadAgentAuthStatus(state);
+
+    expect(request).toHaveBeenCalledWith("doctor.auth.status", {});
+    expect(state.agentsAuthStatus).toEqual(payload);
+    expect(state.agentsAuthStatusError).toBeNull();
+    expect(state.agentsAuthStatusLoading).toBe(false);
+  });
+
+  it("captures request errors for diagnostics", async () => {
+    const { state, request } = createState();
+    request.mockRejectedValue(new Error("doctor auth failed"));
+
+    await loadAgentAuthStatus(state);
+
+    expect(state.agentsAuthStatus).toBeNull();
+    expect(state.agentsAuthStatusError).toContain("doctor auth failed");
+    expect(state.agentsAuthStatusLoading).toBe(false);
   });
 });
 

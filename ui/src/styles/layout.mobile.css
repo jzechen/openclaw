@@ -181,6 +181,17 @@
     font-size: 14px;
   }
 
+  .agent-llm-fallback-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .llm-provider-grid,
+  .llm-model-grid,
+  .llm-alias-row {
+    grid-template-columns: 1fr;
+  }
+
   /* Buttons */
   .btn {
     padding: 8px 12px;
