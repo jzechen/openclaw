@@ -2,14 +2,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUNTIME_DIR="${SCRIPT_DIR}/runtime"
-ENTRY="${RUNTIME_DIR}/openclaw.mjs"
-
-if [[ ! -f "${ENTRY}" ]]; then
-  echo "[error] missing bundled runtime: ${ENTRY}" >&2
-  echo "[hint] run: ./deployment/build-local-runtime.sh" >&2
-  exit 1
-fi
 
 normalize_os() {
   case "$(uname -s)" in
@@ -35,6 +27,21 @@ normalize_arch() {
 
 OS="$(normalize_os)"
 ARCH="$(normalize_arch)"
+SEA_BIN="${SCRIPT_DIR}/openclaw-sea-${OS}-${ARCH}"
+
+if [[ -x "${SEA_BIN}" ]]; then
+  exec "${SEA_BIN}" "$@"
+fi
+
+RUNTIME_DIR="${SCRIPT_DIR}/runtime"
+ENTRY="${RUNTIME_DIR}/openclaw.mjs"
+
+if [[ ! -f "${ENTRY}" ]]; then
+  echo "[error] missing bundled runtime: ${ENTRY}" >&2
+  echo "[hint] run: ./deployment/build-local-runtime.sh or build SEA binary" >&2
+  exit 1
+fi
+
 NODE_BIN="${SCRIPT_DIR}/node-${OS}-${ARCH}"
 
 if [[ ! -x "${NODE_BIN}" ]]; then

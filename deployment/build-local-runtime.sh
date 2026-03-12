@@ -15,29 +15,14 @@ pnpm ui:build
 
 echo "[build] staging runtime into deployment/bin/runtime..."
 rm -rf "${RUNTIME_DIR}"
-mkdir -p "${RUNTIME_DIR}"
 
-cp "${REPO_ROOT}/openclaw.mjs" "${RUNTIME_DIR}/openclaw.mjs"
-cp -R "${REPO_ROOT}/dist" "${RUNTIME_DIR}/dist"
-cp "${REPO_ROOT}/package.json" "${RUNTIME_DIR}/package.json"
-mkdir -p "${RUNTIME_DIR}/docs/reference"
-cp -R "${REPO_ROOT}/docs/reference/templates" "${RUNTIME_DIR}/docs/reference/templates"
-if [[ -f "${REPO_ROOT}/pnpm-lock.yaml" ]]; then
-  cp "${REPO_ROOT}/pnpm-lock.yaml" "${RUNTIME_DIR}/pnpm-lock.yaml"
-fi
-
-if [[ ! -d "${REPO_ROOT}/node_modules" ]]; then
-  echo "[error] missing node_modules at repo root" >&2
-  echo "[hint] run: pnpm install" >&2
-  exit 1
-fi
-
-echo "[build] bundling runtime dependencies into deployment/bin/runtime/node_modules..."
-if command -v rsync >/dev/null 2>&1; then
-  rsync -a --delete "${REPO_ROOT}/node_modules/" "${RUNTIME_DIR}/node_modules/"
-else
-  cp -R "${REPO_ROOT}/node_modules" "${RUNTIME_DIR}/node_modules"
-fi
+echo "[build] deploying portable runtime (hoisted, no symlinks)..."
+pnpm --filter openclaw deploy --prod --legacy \
+  --config.node-linker=hoisted \
+  --config.link-workspace-packages=false \
+  --config.prefer-workspace-packages=false \
+  --config.inject-workspace-packages=false \
+  "${RUNTIME_DIR}"
 
 if command -v node >/dev/null 2>&1; then
   OS_RAW="$(uname -s)"
