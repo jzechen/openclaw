@@ -840,6 +840,14 @@ start_gateway_background() {
 stop_gateway_background() {
   local pid_file
   pid_file="${STATE_DIR}/gateway.pid"
+  local stopped_any=0
+
+  # Preferred path: let OpenClaw stop managed/unmanaged gateway instances.
+  if oc gateway stop >/dev/null 2>&1; then
+    echo "[stop] requested gateway stop via openclaw gateway stop"
+    stopped_any=1
+  fi
+
   if [[ -f "${pid_file}" ]]; then
     local pid
     pid="$(cat "${pid_file}" 2>/dev/null || true)"
@@ -850,13 +858,19 @@ stop_gateway_background() {
         kill -9 "${pid}" >/dev/null 2>&1 || true
       fi
       echo "[stop] stopped gateway pid=${pid}"
+      stopped_any=1
     fi
     rm -f "${pid_file}"
   fi
 
   # Fallback: stop orphaned background runs not tracked by pid file.
   local pids
-  pids="$(pgrep -f "${LOCAL_OPENCLAW} gateway run" || true)"
+  pids="$(
+    {
+      pgrep -f "${LOCAL_OPENCLAW} gateway run" 2>/dev/null || true
+      pgrep -f "${SCRIPT_DIR}/bin/runtime/openclaw.mjs gateway run" 2>/dev/null || true
+    } | awk '!seen[$0]++'
+  )"
   if [[ -n "${pids}" ]]; then
     while IFS= read -r p; do
       [[ -z "${p}" ]] && continue
@@ -866,7 +880,39 @@ stop_gateway_background() {
         kill -9 "${p}" >/dev/null 2>&1 || true
       fi
       echo "[stop] stopped orphan gateway pid=${p}"
+      stopped_any=1
     done <<<"${pids}"
+  fi
+
+  # Fallback: stop openclaw listeners on configured gateway port.
+  local port port_pids
+  port="$(read_config_value gateway.port)"
+  if [[ -z "${port}" ]]; then
+    port="18789"
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    port_pids="$(lsof -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true)"
+    if [[ -n "${port_pids}" ]]; then
+      while IFS= read -r p; do
+        [[ -z "${p}" ]] && continue
+        local cmdline
+        cmdline="$(ps -o command= -p "${p}" 2>/dev/null || true)"
+        if [[ "${cmdline}" != *openclaw* && "${cmdline}" != *openclaw.mjs* ]]; then
+          continue
+        fi
+        kill "${p}" >/dev/null 2>&1 || true
+        sleep 1
+        if kill -0 "${p}" >/dev/null 2>&1; then
+          kill -9 "${p}" >/dev/null 2>&1 || true
+        fi
+        echo "[stop] stopped port listener pid=${p} (port=${port})"
+        stopped_any=1
+      done <<<"${port_pids}"
+    fi
+  fi
+
+  if [[ "${stopped_any}" != "1" ]]; then
+    echo "[stop] no running background gateway process found"
   fi
 }
 
