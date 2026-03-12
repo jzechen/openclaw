@@ -264,7 +264,7 @@ print_config_value() {
 }
 
 apply_base_config() {
-  ensure_valid_config_for_startup
+  #ensure_valid_config_for_startup
   set_config_default gateway.mode local
   set_config_default gateway.port 18789
   set_config_default gateway.bind loopback

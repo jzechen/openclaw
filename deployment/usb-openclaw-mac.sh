@@ -868,7 +868,7 @@ EOF
 }
 
 apply_base_config() {
-  ensure_valid_config_for_startup
+  # ensure_valid_config_for_startup
   # Only fill defaults when keys are missing. Never overwrite imported custom config.
   set_config_default gateway.mode local
   set_config_default gateway.port 18789
