@@ -94,6 +94,8 @@ async function main() {
   const launcherSource = createLauncherSource({
     runtimeHash,
     assetKey: RUNTIME_ASSET_KEY,
+    lite,
+    liteExcludePrefixes: LITE_EXCLUDE_PREFIXES,
   });
   await fs.writeFile(launcherPath, launcherSource, "utf8");
 
@@ -380,6 +382,8 @@ function normalizeTarEntryPath(entryPath) {
 function createLauncherSource(params) {
   const runtimeHash = JSON.stringify(params.runtimeHash);
   const assetKey = JSON.stringify(params.assetKey);
+  const liteMode = JSON.stringify(Boolean(params.lite));
+  const liteExcludePrefixes = JSON.stringify(params.liteExcludePrefixes ?? []);
   return `#!/usr/bin/env node
 const fs = require("node:fs");
 const os = require("node:os");
@@ -391,6 +395,8 @@ const { pathToFileURL } = require("node:url");
 const RUNTIME_HASH = ${runtimeHash};
 const RUNTIME_ASSET_KEY = ${assetKey};
 const RUNTIME_MARKER_FILE = ".openclaw-sea-runtime-hash";
+const LITE_MODE = ${liteMode};
+const LITE_EXCLUDE_PREFIXES = ${liteExcludePrefixes};
 
 function runtimeCacheRoot() {
   const home = os.homedir();
@@ -460,13 +466,64 @@ function resolveSafeLinkTargets(baseDir, entryTargetPath, rawLinkPath) {
   const safe = [];
   for (const resolved of candidates) {
     if (resolved !== base && !resolved.startsWith(base + path.sep)) {
-      throw new Error("unsafe tar link target: " + rawLinkPath);
+      continue;
     }
     if (!safe.includes(resolved)) {
       safe.push(resolved);
     }
   }
+  if (safe.length === 0) {
+    throw new Error("unsafe tar link target: " + rawLinkPath);
+  }
   return safe;
+}
+
+function isOptionalNodeModulesBinLink(entryPath) {
+  const normalized = String(entryPath || "")
+    .replace(/\\\\\\\\/g, "/")
+    .replace(/^\\.\\//, "")
+    .replace(/^\\/+/, "");
+  return normalized.startsWith("node_modules/.bin/");
+}
+
+function normalizeTarPath(rawPath) {
+  return String(rawPath || "")
+    .replace(/\\\\\\\\/g, "/")
+    .replace(/^\\.\\//, "")
+    .replace(/^\\/+/, "");
+}
+
+function isLiteExcludedRuntimePath(rawPath) {
+  if (!LITE_MODE) return false;
+  const normalized = normalizeTarPath(rawPath);
+  if (!normalized) return false;
+  return LITE_EXCLUDE_PREFIXES.some(
+    (prefix) => normalized === prefix || normalized.startsWith(prefix + "/"),
+  );
+}
+
+function isSkippableMissingLink(destination, link) {
+  if (isOptionalNodeModulesBinLink(link.entryPath)) {
+    return true;
+  }
+  if (!LITE_MODE) {
+    return false;
+  }
+
+  if (isLiteExcludedRuntimePath(link.entryPath) || isLiteExcludedRuntimePath(link.linkName)) {
+    return true;
+  }
+
+  try {
+    const candidates = resolveSafeLinkTargets(destination, link.target, link.linkName);
+    return candidates.some((candidate) => {
+      const rel = path.relative(destination, candidate);
+      if (rel.startsWith("..")) return false;
+      return isLiteExcludedRuntimePath(rel);
+    });
+  } catch {
+    return false;
+  }
 }
 
 function applyMode(target, mode) {
@@ -567,8 +624,10 @@ function extractTarBuffer(buffer, destination) {
   }
 
   if (unresolved.length > 0) {
-    const first = unresolved[0];
-    throw new Error("tar link target missing: " + first.linkName + " for " + first.entryPath);
+    const blocking = unresolved.find((link) => !isSkippableMissingLink(destination, link));
+    if (blocking) {
+      throw new Error("tar link target missing: " + blocking.linkName + " for " + blocking.entryPath);
+    }
   }
 }
 
@@ -627,10 +686,21 @@ const run = async () => {
 
   const entryPath = path.join(extractedRuntime, "openclaw.mjs");
   const rawArgv = process.argv.filter((arg) => !String(arg).startsWith("--disable-warning="));
+  const originalArgv1 = rawArgv[1] ?? "";
   process.env.OPENCLAW_SEA_ORIGINAL_ARGV1 = rawArgv[1] ?? "";
   const userArgs = rawArgv
     .slice(1)
     .filter((arg) => !String(arg).endsWith("openclaw.mjs") && !String(arg).endsWith("sea-launcher.cjs"));
+  if (userArgs.length > 0) {
+    const first = String(userArgs[0]);
+    const firstIsSelfPath =
+      first === originalArgv1 ||
+      first === process.execPath ||
+      path.basename(first).startsWith("openclaw-sea-");
+    if (firstIsSelfPath) {
+      userArgs.shift();
+    }
+  }
   process.argv = [rawArgv[0] ?? process.execPath, entryPath, ...userArgs];
 
   await import(pathToFileURL(entryPath).href);

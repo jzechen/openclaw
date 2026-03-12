@@ -99,7 +99,7 @@ SOURCE_STATE_DIR="${USB_ROOT}/state-mac"
 SOURCE_CONFIG_PATH="${CONFIG_ROOT}/openclaw-mac.json"
 SOURCE_WORKSPACE_DIR="${USB_ROOT}/workspace"
 SOURCE_CODEX_HOME_DIR="${USB_ROOT}/codex-home"
-RUNTIME_TEMPLATE_DIR="${SCRIPT_DIR}/bin/runtime/docs/reference/templates"
+RUNTIME_TEMPLATE_DIR_DEFAULT="${SCRIPT_DIR}/bin/runtime/docs/reference/templates"
 
 DEFAULT_OPENCLAW_HOME="${HOME}/.openclaw"
 DEFAULT_CODEX_HOME="${HOME}/.codex"
@@ -109,6 +109,22 @@ CONFIG_PATH="${DEFAULT_OPENCLAW_HOME}/openclaw.json"
 WORKSPACE_DIR="${DEFAULT_OPENCLAW_HOME}/workspace"
 CODEX_HOME_DIR="${DEFAULT_CODEX_HOME}"
 CONFIG_ROOT="${DEFAULT_OPENCLAW_HOME}"
+
+resolve_runtime_template_dir() {
+  local candidate
+  for candidate in \
+    "${SCRIPT_DIR}/bin/runtime/docs/reference/templates" \
+    "${SCRIPT_DIR}/docs/reference/templates" \
+    "${SCRIPT_DIR}/../docs/reference/templates"; do
+    if [[ -d "${candidate}" ]]; then
+      echo "${candidate}"
+      return
+    fi
+  done
+  echo "${RUNTIME_TEMPLATE_DIR_DEFAULT}"
+}
+
+RUNTIME_TEMPLATE_DIR="$(resolve_runtime_template_dir)"
 
 mkdir -p "${STATE_DIR}" "${WORKSPACE_DIR}" "${CODEX_HOME_DIR}"
 
@@ -548,6 +564,8 @@ ensure_gateway_token() {
     token="$(generate_token)"
     if oc config set gateway.auth.token "${token}" >/dev/null 2>&1; then
       echo "[init] generated gateway.auth.token in ${CONFIG_PATH}"
+    elif [[ "$(set_config_value_direct gateway.auth.token "${token}")" == "1" ]]; then
+      echo "[init] generated gateway.auth.token in ${CONFIG_PATH} (direct write fallback)"
     else
       echo "[warn] failed to generate gateway.auth.token automatically"
     fi
@@ -592,6 +610,76 @@ try{
 }' "${CONFIG_PATH}" "${key}"
 }
 
+set_config_value_direct() {
+  local key="$1"
+  local raw_value="$2"
+  node_eval '
+const fs=require("fs");
+const path=require("path");
+const [configPath,key,rawValue]=process.argv.slice(1);
+if (!configPath || !key) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+const parseConfig=(raw)=>{
+  try {
+    return JSON.parse(raw);
+  } catch {
+    try {
+      const json5=require("json5");
+      return json5.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+};
+let cfg={};
+if (fs.existsSync(configPath)) {
+  let parsed=null;
+  try {
+    parsed=parseConfig(fs.readFileSync(configPath,"utf8"));
+  } catch {
+    parsed=null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    process.stdout.write("0");
+    process.exit(0);
+  }
+  cfg=parsed;
+}
+const parts=key.split(".").filter(Boolean);
+if (parts.length === 0) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+let cursor=cfg;
+for (let i=0;i<parts.length-1;i++) {
+  const part=parts[i];
+  const next=cursor[part];
+  if (!next || typeof next !== "object" || Array.isArray(next)) {
+    cursor[part]={};
+  }
+  cursor=cursor[part];
+}
+const leaf=parts[parts.length-1];
+let value=rawValue;
+if (rawValue === "true") {
+  value=true;
+} else if (rawValue === "false") {
+  value=false;
+} else if (/^-?[0-9]+$/.test(rawValue)) {
+  const parsedInt=Number(rawValue);
+  if (Number.isSafeInteger(parsedInt)) {
+    value=parsedInt;
+  }
+}
+cursor[leaf]=value;
+fs.mkdirSync(path.dirname(configPath), { recursive: true });
+fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n");
+process.stdout.write("1");
+' "${CONFIG_PATH}" "${key}" "${raw_value}"
+}
+
 set_config_default() {
   local key="$1"
   local value="$2"
@@ -599,7 +687,11 @@ set_config_default() {
   present="$(config_value_present "${key}")"
   if [[ "${present}" != "1" ]]; then
     if ! oc config set "${key}" "${value}" >/dev/null 2>&1; then
-      echo "[warn] failed to set default config '${key}' (config may still be invalid)"
+      if [[ "$(set_config_value_direct "${key}" "${value}")" == "1" ]]; then
+        echo "[init] wrote default config '${key}' via direct fallback"
+      else
+        echo "[warn] failed to set default config '${key}' (config may still be invalid)"
+      fi
     fi
   fi
 }
@@ -737,6 +829,18 @@ ensure_workspace_bootstrap() {
     fi
   fi
 
+  local name missing_any
+  missing_any=0
+  for name in AGENTS.md BOOTSTRAP.md HEARTBEAT.md IDENTITY.md SOUL.md TOOLS.md USER.md; do
+    if [[ ! -f "${workspace}/${name}" ]]; then
+      missing_any=1
+      break
+    fi
+  done
+  if [[ "${missing_any}" == "0" ]]; then
+    return
+  fi
+
   echo "[warn] failed to ensure workspace bootstrap files via 'openclaw setup --workspace ${workspace}'"
   if [[ ! -d "${RUNTIME_TEMPLATE_DIR}" ]]; then
     echo "[warn] runtime template dir not found: ${RUNTIME_TEMPLATE_DIR}"
@@ -803,7 +907,10 @@ print_dashboard_hint() {
 print_config_value() {
   local key="$1"
   local value
-  value="$(oc config get "${key}" 2>/dev/null | tail -n 1 || true)"
+  value="$(read_config_value "${key}")"
+  if [[ -z "${value}" ]]; then
+    value="$(oc config get "${key}" 2>/dev/null | tail -n 1 || true)"
+  fi
   if [[ -z "${value}" ]]; then
     echo "(unset)"
     return
