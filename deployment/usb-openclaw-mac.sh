@@ -23,17 +23,19 @@ OPENCLAW_CODEX_SOURCE_SYNC_MODE="${OPENCLAW_CODEX_SOURCE_SYNC_MODE:-if-missing}"
 usage() {
   cat <<'USAGE'
 Usage:
-  usb-openclaw-mac.sh <init|run|status|dashboard> [data_root_path] [dashboard]
+  usb-openclaw-mac.sh <init|run|run-bg|stop|status|dashboard> [data_root_path] [dashboard]
 
 Examples:
   ./deployment/usb-openclaw-mac.sh init
   ./deployment/usb-openclaw-mac.sh run
+  ./deployment/usb-openclaw-mac.sh run-bg
+  ./deployment/usb-openclaw-mac.sh stop
   ./deployment/usb-openclaw-mac.sh run ./deployment/data dashboard
   ./deployment/usb-openclaw-mac.sh dashboard
 USAGE
 }
 
-if [[ "${ACTION}" == "run" ]]; then
+if [[ "${ACTION}" == "run" || "${ACTION}" == "run-bg" ]]; then
   if [[ "${USB_ROOT_INPUT}" == "dashboard" ]]; then
     USB_ROOT_INPUT="${OPENCLAW_USB_ROOT:-${DEFAULT_ROOT}}"
     OPEN_DASHBOARD_ON_RUN=true
@@ -82,12 +84,50 @@ oc() {
   "${LOCAL_OPENCLAW}" "$@"
 }
 
-STATE_DIR="${USB_ROOT}/state-mac"
-CONFIG_PATH="${CONFIG_ROOT}/openclaw-mac.json"
-WORKSPACE_DIR="${USB_ROOT}/workspace"
-CODEX_HOME_DIR="${USB_ROOT}/codex-home"
+SOURCE_STATE_DIR="${USB_ROOT}/state-mac"
+SOURCE_CONFIG_PATH="${CONFIG_ROOT}/openclaw-mac.json"
+SOURCE_WORKSPACE_DIR="${USB_ROOT}/workspace"
+SOURCE_CODEX_HOME_DIR="${USB_ROOT}/codex-home"
+
+DEFAULT_OPENCLAW_HOME="${HOME}/.openclaw"
+DEFAULT_CODEX_HOME="${HOME}/.codex"
+
+STATE_DIR="${DEFAULT_OPENCLAW_HOME}"
+CONFIG_PATH="${DEFAULT_OPENCLAW_HOME}/openclaw.json"
+WORKSPACE_DIR="${DEFAULT_OPENCLAW_HOME}/workspace"
+CODEX_HOME_DIR="${DEFAULT_CODEX_HOME}"
+CONFIG_ROOT="${DEFAULT_OPENCLAW_HOME}"
 
 mkdir -p "${STATE_DIR}" "${WORKSPACE_DIR}" "${CODEX_HOME_DIR}"
+
+merge_dir_if_present() {
+  local src="$1"
+  local dst="$2"
+  local label="$3"
+  if [[ ! -d "${src}" ]]; then
+    return
+  fi
+  mkdir -p "${dst}"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --ignore-existing "${src}/" "${dst}/"
+  else
+    cp -R -n "${src}/." "${dst}/"
+  fi
+  echo "[migrate] merged ${label}: ${src} -> ${dst}"
+}
+
+migrate_to_default_home() {
+  if [[ -f "${SOURCE_CONFIG_PATH}" && ! -f "${CONFIG_PATH}" ]]; then
+    mkdir -p "$(dirname "${CONFIG_PATH}")"
+    cp "${SOURCE_CONFIG_PATH}" "${CONFIG_PATH}"
+    echo "[migrate] copied config: ${SOURCE_CONFIG_PATH} -> ${CONFIG_PATH}"
+  fi
+  merge_dir_if_present "${SOURCE_STATE_DIR}" "${STATE_DIR}" "state"
+  merge_dir_if_present "${SOURCE_WORKSPACE_DIR}" "${WORKSPACE_DIR}" "workspace"
+  merge_dir_if_present "${SOURCE_CODEX_HOME_DIR}" "${CODEX_HOME_DIR}" "codex-home"
+}
+
+migrate_to_default_home
 
 export OPENCLAW_STATE_DIR="${STATE_DIR}"
 export OPENCLAW_CONFIG_PATH="${CONFIG_PATH}"
@@ -638,6 +678,51 @@ print_status() {
   print_config_value agents.defaults.model.primary
 }
 
+start_gateway_background() {
+  local log_dir log_file pid_file
+  log_dir="${STATE_DIR}/logs"
+  log_file="${log_dir}/gateway.log"
+  pid_file="${STATE_DIR}/gateway.pid"
+  mkdir -p "${log_dir}"
+  nohup "${LOCAL_OPENCLAW}" gateway run >"${log_file}" 2>&1 &
+  echo $! >"${pid_file}"
+  echo "[run-bg] gateway started in background (pid=$(cat "${pid_file}"))"
+  echo "[run-bg] log: ${log_file}"
+}
+
+stop_gateway_background() {
+  local pid_file
+  pid_file="${STATE_DIR}/gateway.pid"
+  if [[ -f "${pid_file}" ]]; then
+    local pid
+    pid="$(cat "${pid_file}" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
+      kill "${pid}" >/dev/null 2>&1 || true
+      sleep 1
+      if kill -0 "${pid}" >/dev/null 2>&1; then
+        kill -9 "${pid}" >/dev/null 2>&1 || true
+      fi
+      echo "[stop] stopped gateway pid=${pid}"
+    fi
+    rm -f "${pid_file}"
+  fi
+
+  # Fallback: stop orphaned background runs not tracked by pid file.
+  local pids
+  pids="$(pgrep -f "${LOCAL_OPENCLAW} gateway run" || true)"
+  if [[ -n "${pids}" ]]; then
+    while IFS= read -r p; do
+      [[ -z "${p}" ]] && continue
+      kill "${p}" >/dev/null 2>&1 || true
+      sleep 1
+      if kill -0 "${p}" >/dev/null 2>&1; then
+        kill -9 "${p}" >/dev/null 2>&1 || true
+      fi
+      echo "[stop] stopped orphan gateway pid=${p}"
+    done <<<"${pids}"
+  fi
+}
+
 case "${ACTION}" in
   init)
     apply_base_config
@@ -650,6 +735,17 @@ case "${ACTION}" in
       print_dashboard_hint open
     fi
     oc gateway run
+    ;;
+  run-bg)
+    apply_base_config
+    print_status
+    if [[ "${OPEN_DASHBOARD_ON_RUN}" == "true" ]]; then
+      print_dashboard_hint open
+    fi
+    start_gateway_background
+    ;;
+  stop)
+    stop_gateway_background
     ;;
   dashboard)
     apply_base_config

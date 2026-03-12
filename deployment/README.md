@@ -111,19 +111,31 @@ chmod +x deployment/bin/openclaw deployment/usb-openclaw-mac.sh
 ./deployment/usb-openclaw-mac.sh run
 ```
 
+Run in background:
+
+```bash
+./deployment/usb-openclaw-mac.sh run-bg
+```
+
+Stop background gateway:
+
+```bash
+./deployment/usb-openclaw-mac.sh stop
+```
+
 Open dashboard with tokenized URL (recommended for `gateway.auth.mode=token`):
 
 ```bash
 ./deployment/usb-openclaw-mac.sh dashboard
 ```
 
-Optional custom root:
+Optional migration source root:
 
 ```bash
 ./deployment/usb-openclaw-mac.sh run ./deployment/data
 ```
 
-Optional custom config root:
+Optional migration source config root:
 
 ```bash
 OPENCLAW_CONFIG_ROOT=./deployment/config ./deployment/usb-openclaw-mac.sh run ./deployment/data
@@ -135,19 +147,37 @@ Run gateway and auto-open dashboard in one command:
 ./deployment/usb-openclaw-mac.sh run ./deployment/data dashboard
 ```
 
+Run gateway in background and auto-open dashboard:
+
+```bash
+./deployment/usb-openclaw-mac.sh run-bg ./deployment/data dashboard
+```
+
 ## Windows Native (No WSL)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Action run
 ```
 
-Optional custom root:
+Run in background:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Action run-bg
+```
+
+Stop background gateway:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Action stop
+```
+
+Optional migration source root:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Action run -UsbRoot "D:\portable-openclaw-data"
 ```
 
-Optional custom config root:
+Optional migration source config root:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Action run -ConfigRoot "D:\portable-openclaw-config"
@@ -165,10 +195,28 @@ Run gateway and auto-open dashboard in one command:
 powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Action run -Dashboard
 ```
 
+Run gateway in background and auto-open dashboard:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Action run-bg -Dashboard
+```
+
 The wrapper defaults to native mode (`-Mode native`). You can also call native script directly:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win-native.ps1 -Action run
+```
+
+Native background run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win-native.ps1 -Action run-bg
+```
+
+Native background stop:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win-native.ps1 -Action stop
 ```
 
 Native direct dashboard:
@@ -183,6 +231,12 @@ powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win-native.ps
 powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Mode wsl -Action run
 ```
 
+Stop background gateway in WSL mode:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Mode wsl -Action stop
+```
+
 ## WSL direct
 
 ```bash
@@ -190,7 +244,13 @@ chmod +x deployment/bin/openclaw deployment/usb-openclaw-wsl.sh
 ./deployment/usb-openclaw-wsl.sh run
 ```
 
-Optional custom config root:
+Stop background gateway:
+
+```bash
+./deployment/usb-openclaw-wsl.sh stop
+```
+
+Optional migration source config root:
 
 ```bash
 OPENCLAW_CONFIG_ROOT=./deployment/config ./deployment/usb-openclaw-wsl.sh run ./deployment/data
@@ -231,8 +291,10 @@ CODEX_HOME=./deployment/data/codex-home \
 
 ## Notes
 
-- Scripts default to `deployment/config` for config and `deployment/data` for state/workspace.
-- Scripts set `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH`, and `CODEX_HOME` automatically.
+- Scripts treat `deployment/config` and `deployment/data` as migration sources.
+- On startup, scripts migrate available config/state/workspace/codex-home into the default OpenClaw home (`~/.openclaw` or `%USERPROFILE%\.openclaw`) and default Codex home (`~/.codex` or `%USERPROFILE%\.codex`).
+- Scripts then run against the default paths (`openclaw.json` under default OpenClaw home) so CLI/app share one environment instead of isolated deployment-only state.
+- Scripts still set `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH`, and `CODEX_HOME` to those default locations for explicitness.
 - Scripts run `openclaw setup --workspace <resolved-workspace>` on startup to ensure bootstrap files exist (`AGENTS.md`, `SOUL.md`, `USER.md`, etc.) without overwriting existing files.
 - If both `MEMORY.md` and `memory.md` are absent, scripts create a starter `MEMORY.md`.
 - If `gateway.auth.token` is missing, scripts auto-generate one.

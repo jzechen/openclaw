@@ -13,18 +13,31 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ACTION="${1:-run}"
 DEFAULT_ROOT="${SCRIPT_DIR}/data"
 USB_ROOT_INPUT="${2:-${OPENCLAW_USB_ROOT:-${DEFAULT_ROOT}}}"
+EXTRA_ARG="${3:-}"
+OPEN_DASHBOARD_ON_RUN=false
 CONFIG_ROOT_INPUT="${OPENCLAW_CONFIG_ROOT:-${SCRIPT_DIR}/config}"
 
 usage() {
   cat <<'USAGE'
 Usage:
-  usb-openclaw-wsl.sh <init|run|status> [data_root_path]
+  usb-openclaw-wsl.sh <init|run|run-bg|stop|status> [data_root_path] [dashboard]
 
 Examples:
   ./deployment/usb-openclaw-wsl.sh init
   ./deployment/usb-openclaw-wsl.sh run
+  ./deployment/usb-openclaw-wsl.sh run-bg
+  ./deployment/usb-openclaw-wsl.sh stop
 USAGE
 }
+
+if [[ "${ACTION}" == "run" || "${ACTION}" == "run-bg" ]]; then
+  if [[ "${USB_ROOT_INPUT}" == "dashboard" ]]; then
+    USB_ROOT_INPUT="${OPENCLAW_USB_ROOT:-${DEFAULT_ROOT}}"
+    OPEN_DASHBOARD_ON_RUN=true
+  elif [[ "${EXTRA_ARG}" == "dashboard" ]]; then
+    OPEN_DASHBOARD_ON_RUN=true
+  fi
+fi
 
 mkdir -p "${USB_ROOT_INPUT}"
 USB_ROOT="$(cd "${USB_ROOT_INPUT}" && pwd)"
@@ -173,6 +186,79 @@ print_status() {
   print_config_value agents.defaults.model.primary
 }
 
+print_dashboard_hint() {
+  local mode="${1:-no-open}"
+  echo "[hint] Open dashboard with tokenized URL:"
+  local output url
+  output="$(oc dashboard --no-open 2>&1 || true)"
+  printf '%s\n' "${output}"
+  url="$(printf '%s\n' "${output}" | sed -n 's/^Dashboard URL: //p' | head -n 1)"
+  if [[ "${mode}" == "open" && -n "${url}" ]]; then
+    if command -v xdg-open >/dev/null 2>&1; then
+      if xdg-open "${url}" >/dev/null 2>&1; then
+        echo "Opened in your browser. Keep that tab to control OpenClaw."
+      else
+        echo "[warn] Browser auto-open failed. Use the URL above."
+      fi
+    else
+      echo "[warn] Browser auto-open is not available. Use the URL above."
+    fi
+  fi
+}
+
+start_gateway_background() {
+  local log_dir log_file pid_file
+  log_dir="${STATE_DIR}/logs"
+  log_file="${log_dir}/gateway.log"
+  pid_file="${STATE_DIR}/gateway.pid"
+  mkdir -p "${log_dir}"
+  nohup "${LOCAL_OPENCLAW}" gateway run >"${log_file}" 2>&1 &
+  echo $! >"${pid_file}"
+  echo "[run-bg] gateway started in background (pid=$(cat "${pid_file}"))"
+  echo "[run-bg] log: ${log_file}"
+}
+
+stop_gateway_background() {
+  local pid_file
+  pid_file="${STATE_DIR}/gateway.pid"
+  local stopped_any=0
+
+  if [[ -f "${pid_file}" ]]; then
+    local pid
+    pid="$(cat "${pid_file}" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
+      kill "${pid}" >/dev/null 2>&1 || true
+      sleep 1
+      if kill -0 "${pid}" >/dev/null 2>&1; then
+        kill -9 "${pid}" >/dev/null 2>&1 || true
+      fi
+      echo "[stop] stopped gateway pid=${pid}"
+      stopped_any=1
+    fi
+    rm -f "${pid_file}"
+  fi
+
+  # Fallback: stop orphaned background runs not tracked by pid file.
+  local pids
+  pids="$(pgrep -f "${LOCAL_OPENCLAW} gateway run" || true)"
+  if [[ -n "${pids}" ]]; then
+    while IFS= read -r p; do
+      [[ -z "${p}" ]] && continue
+      kill "${p}" >/dev/null 2>&1 || true
+      sleep 1
+      if kill -0 "${p}" >/dev/null 2>&1; then
+        kill -9 "${p}" >/dev/null 2>&1 || true
+      fi
+      echo "[stop] stopped orphan gateway pid=${p}"
+      stopped_any=1
+    done <<<"${pids}"
+  fi
+
+  if [[ "${stopped_any}" != "1" ]]; then
+    echo "[stop] no running background gateway process found"
+  fi
+}
+
 case "${ACTION}" in
   init)
     apply_base_config
@@ -181,7 +267,21 @@ case "${ACTION}" in
   run)
     apply_base_config
     print_status
+    if [[ "${OPEN_DASHBOARD_ON_RUN}" == "true" ]]; then
+      print_dashboard_hint open
+    fi
     oc gateway run
+    ;;
+  run-bg)
+    apply_base_config
+    print_status
+    if [[ "${OPEN_DASHBOARD_ON_RUN}" == "true" ]]; then
+      print_dashboard_hint open
+    fi
+    start_gateway_background
+    ;;
+  stop)
+    stop_gateway_background
     ;;
   status)
     print_status

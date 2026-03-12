@@ -3,7 +3,7 @@ param(
 
   [string]$ConfigRoot,
 
-  [ValidateSet("init", "run", "status", "dashboard")]
+  [ValidateSet("init", "run", "run-bg", "stop", "status", "dashboard")]
   [string]$Action = "run",
 
   [switch]$Dashboard
@@ -51,14 +51,53 @@ function Get-BundledNodePath {
 
 $NodeBin = Get-BundledNodePath
 
-$StateDir = Join-Path $UsbRoot "state-win"
-$ConfigPath = Join-Path $ConfigRoot "openclaw-win.json"
-$WorkspaceDir = Join-Path $UsbRoot "workspace"
-$CodexHomeDir = Join-Path $UsbRoot "codex-home"
+function Merge-DirectoryIfPresent {
+  param(
+    [Parameter(Mandatory = $true)][string]$Source,
+    [Parameter(Mandatory = $true)][string]$Destination,
+    [Parameter(Mandatory = $true)][string]$Label
+  )
+
+  if (-not (Test-Path -LiteralPath $Source)) {
+    return
+  }
+  New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+
+  $RoboCopy = Get-Command robocopy -ErrorAction SilentlyContinue
+  if ($RoboCopy) {
+    & robocopy $Source $Destination /E /R:2 /W:1 /XC /XN /XO /NFL /NDL /NJH /NJS /NP | Out-Null
+    $RoboCode = $LASTEXITCODE
+    if ($RoboCode -gt 7) {
+      throw "robocopy migrate failed for $Label with exit code $RoboCode"
+    }
+  }
+  Write-Host "[migrate] merged ${Label}: $Source -> $Destination"
+}
+
+$SourceStateDir = Join-Path $UsbRoot "state-win"
+$SourceConfigPath = Join-Path $ConfigRoot "openclaw-win.json"
+$SourceWorkspaceDir = Join-Path $UsbRoot "workspace"
+$SourceCodexHomeDir = Join-Path $UsbRoot "codex-home"
+
+$DefaultOpenClawHome = Join-Path $HOME ".openclaw"
+$DefaultCodexHome = Join-Path $HOME ".codex"
+
+$StateDir = $DefaultOpenClawHome
+$ConfigPath = Join-Path $DefaultOpenClawHome "openclaw.json"
+$WorkspaceDir = Join-Path $DefaultOpenClawHome "workspace"
+$CodexHomeDir = $DefaultCodexHome
 
 New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
 New-Item -ItemType Directory -Path $WorkspaceDir -Force | Out-Null
 New-Item -ItemType Directory -Path $CodexHomeDir -Force | Out-Null
+
+if ((Test-Path -LiteralPath $SourceConfigPath) -and -not (Test-Path -LiteralPath $ConfigPath)) {
+  Copy-Item -Path $SourceConfigPath -Destination $ConfigPath -Force
+  Write-Host "[migrate] copied config: $SourceConfigPath -> $ConfigPath"
+}
+Merge-DirectoryIfPresent -Source $SourceStateDir -Destination $StateDir -Label "state"
+Merge-DirectoryIfPresent -Source $SourceWorkspaceDir -Destination $WorkspaceDir -Label "workspace"
+Merge-DirectoryIfPresent -Source $SourceCodexHomeDir -Destination $CodexHomeDir -Label "codex-home"
 
 $env:OPENCLAW_STATE_DIR = $StateDir
 $env:OPENCLAW_CONFIG_PATH = $ConfigPath
@@ -414,15 +453,11 @@ function Print-DashboardHint {
 
 function Print-ConfigValue {
   param([string]$Path)
-  $output = & $LocalOpenClaw config get $Path 2>$null
-  if ($LASTEXITCODE -ne 0) {
+  $value = Get-ConfigValue -Path $Path
+  if ($null -eq $value) {
     return "(unset)"
   }
-  $line = (($output | ForEach-Object { "$_" }) | Select-Object -Last 1)
-  if ([string]::IsNullOrWhiteSpace($line)) {
-    return "(unset)"
-  }
-  return $line.Trim()
+  return "$value"
 }
 
 function Apply-BaseConfig {
@@ -454,6 +489,72 @@ function Print-Status {
   Write-Host (Print-ConfigValue -Path "agents.defaults.model.primary")
 }
 
+function Start-GatewayBackground {
+  $logDir = Join-Path $StateDir "logs"
+  $stdoutLog = Join-Path $logDir "gateway.log"
+  $stderrLog = Join-Path $logDir "gateway.err.log"
+  $pidFile = Join-Path $StateDir "gateway.pid"
+  New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+
+  $proc = Start-Process -FilePath $LocalOpenClaw -ArgumentList @("gateway", "run") -WorkingDirectory $ScriptDir -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+  Set-Content -LiteralPath $pidFile -Value "$($proc.Id)" -Encoding ASCII
+  Write-Host "[run-bg] gateway started in background (pid=$($proc.Id))"
+  Write-Host "[run-bg] pid file: $pidFile"
+  Write-Host "[run-bg] stdout log: $stdoutLog"
+  Write-Host "[run-bg] stderr log: $stderrLog"
+}
+
+function Stop-GatewayBackground {
+  $pidFile = Join-Path $StateDir "gateway.pid"
+  $stoppedAny = $false
+
+  if (Test-Path -LiteralPath $pidFile) {
+    $rawPid = (Get-Content -LiteralPath $pidFile -Raw -ErrorAction SilentlyContinue).Trim()
+    $parsedPid = 0
+    if ([int]::TryParse($rawPid, [ref]$parsedPid) -and $parsedPid -gt 0) {
+      try {
+        $proc = Get-Process -Id $parsedPid -ErrorAction Stop
+        Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+        Write-Host "[stop] stopped gateway pid=$parsedPid (from pid file)"
+        $stoppedAny = $true
+      } catch {
+        Write-Host "[stop] pid file exists but process not running: $parsedPid"
+      }
+    }
+    Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+  }
+
+  # Fallback: stop orphaned background gateway processes started from this deployment.
+  $scriptDirLower = $ScriptDir.ToLowerInvariant()
+  $candidates = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+      if ([string]::IsNullOrWhiteSpace($_.CommandLine)) {
+        return $false
+      }
+      $cmd = $_.CommandLine.ToLowerInvariant()
+      $isGatewayRun = $cmd -match '(^|\s)gateway\s+run(\s|$)'
+      $isDeploymentProcess = $cmd.Contains($scriptDirLower) -or $cmd.Contains('\deployment\bin\openclaw.cmd') -or $cmd.Contains('\deployment\bin\runtime\openclaw.mjs')
+      return $isGatewayRun -and $isDeploymentProcess
+    }
+
+  foreach ($candidate in $candidates) {
+    if (-not $candidate.ProcessId) {
+      continue
+    }
+    try {
+      Stop-Process -Id $candidate.ProcessId -Force -ErrorAction Stop
+      Write-Host "[stop] stopped orphan gateway pid=$($candidate.ProcessId)"
+      $stoppedAny = $true
+    } catch {
+      # ignore races where process has already exited
+    }
+  }
+
+  if (-not $stoppedAny) {
+    Write-Host "[stop] no running background gateway process found"
+  }
+}
+
 switch ($Action) {
   "init" {
     Apply-BaseConfig
@@ -467,6 +568,17 @@ switch ($Action) {
     }
     Invoke-OpenClaw gateway run
   }
+  "run-bg" {
+    Apply-BaseConfig
+    Print-Status
+    if ($Dashboard) {
+      Print-DashboardHint -OpenInBrowser
+    }
+    Start-GatewayBackground
+  }
+  "stop" {
+    Stop-GatewayBackground
+  }
   "dashboard" {
     Apply-BaseConfig
     Print-DashboardHint -OpenInBrowser
@@ -475,3 +587,5 @@ switch ($Action) {
     Print-Status
   }
 }
+
+exit 0

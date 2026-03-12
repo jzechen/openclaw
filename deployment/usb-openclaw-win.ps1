@@ -3,7 +3,7 @@ param(
 
   [string]$ConfigRoot,
 
-  [ValidateSet("init", "run", "status", "dashboard")]
+  [ValidateSet("init", "run", "run-bg", "stop", "status", "dashboard")]
   [string]$Action = "run",
 
   [ValidateSet("native", "wsl")]
@@ -81,7 +81,7 @@ if ($WslConfigRoot) {
 
 wsl -d $Distro -- chmod +x "$WslScript"
 $WslArgs = @($Action, $WslUsbRoot)
-if ($Dashboard -and $Action -eq "run") {
+if ($Dashboard -and ($Action -eq "run" -or $Action -eq "run-bg")) {
   $WslArgs += "dashboard"
 }
 
