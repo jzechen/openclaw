@@ -55,7 +55,7 @@ sea-macos: runtime-macos
 	@command -v node >/dev/null
 	@chmod +x $(DEPLOY_DIR)/build-sea-binary.sh
 	@./$(DEPLOY_DIR)/build-sea-binary.sh $(SEA_ARGS)
-	@cd $(DEPLOY_DIR) && tar -czf portable-runtime-mac.tgz bin/* usb-openclaw-mac.sh
+	@cd $(DEPLOY_DIR) && tar -czf portable-runtime-mac.tgz bin/* usb-openclaw-mac.sh set-openclaw-path-mac.sh
 
 sea-win: runtime-win
 	@$(POWERSHELL) -NoProfile -ExecutionPolicy Bypass -File .\$(DEPLOY_DIR)\build-sea-binary.ps1 \
