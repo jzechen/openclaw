@@ -99,6 +99,7 @@ SOURCE_STATE_DIR="${USB_ROOT}/state-mac"
 SOURCE_CONFIG_PATH="${CONFIG_ROOT}/openclaw-mac.json"
 SOURCE_WORKSPACE_DIR="${USB_ROOT}/workspace"
 SOURCE_CODEX_HOME_DIR="${USB_ROOT}/codex-home"
+RUNTIME_TEMPLATE_DIR="${SCRIPT_DIR}/bin/runtime/docs/reference/templates"
 
 DEFAULT_OPENCLAW_HOME="${HOME}/.openclaw"
 DEFAULT_CODEX_HOME="${HOME}/.codex"
@@ -417,7 +418,8 @@ if (changed || oauthChanged) {
       echo "[init] synced openai-codex OAuth credentials into state (${result#updated:} profile(s))"
       ;;
     no-codex-auth)
-      echo "[warn] ${CODEX_HOME_DIR}/auth.json not found; openai-codex OAuth may require re-login."
+      # Missing auth.json is expected on first-run or keychain-only setups.
+      :
       ;;
     no-codex-tokens)
       echo "[warn] ${CODEX_HOME_DIR}/auth.json is missing access/refresh tokens; openai-codex OAuth may fail."
@@ -544,8 +546,11 @@ ensure_gateway_token() {
   if [[ "${has_token}" != "1" ]]; then
     local token
     token="$(generate_token)"
-    oc config set gateway.auth.token "${token}" >/dev/null
-    echo "[init] generated gateway.auth.token in ${CONFIG_PATH}"
+    if oc config set gateway.auth.token "${token}" >/dev/null 2>&1; then
+      echo "[init] generated gateway.auth.token in ${CONFIG_PATH}"
+    else
+      echo "[warn] failed to generate gateway.auth.token automatically"
+    fi
   fi
   local resolved_token
   resolved_token="$(read_gateway_token)"
@@ -593,7 +598,105 @@ set_config_default() {
   local present
   present="$(config_value_present "${key}")"
   if [[ "${present}" != "1" ]]; then
-    oc config set "${key}" "${value}" >/dev/null
+    if ! oc config set "${key}" "${value}" >/dev/null 2>&1; then
+      echo "[warn] failed to set default config '${key}' (config may still be invalid)"
+    fi
+  fi
+}
+
+remove_config_key_path() {
+  local key_path="$1"
+  node_eval '
+const fs=require("fs");
+const configPath=process.argv[1];
+const keyPath=process.argv[2];
+if (!configPath || !keyPath) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+let cfg;
+try {
+  cfg=JSON.parse(fs.readFileSync(configPath,"utf8"));
+} catch {
+  process.stdout.write("0");
+  process.exit(0);
+}
+const parts=keyPath.split(".").filter(Boolean);
+if (parts.length === 0) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+let obj=cfg;
+for (let i=0;i<parts.length-1;i++) {
+  const part=parts[i];
+  if (!obj || typeof obj !== "object" || !(part in obj)) {
+    process.stdout.write("0");
+    process.exit(0);
+  }
+  obj=obj[part];
+}
+const leaf=parts[parts.length-1];
+if (!obj || typeof obj !== "object" || !(leaf in obj)) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+delete obj[leaf];
+fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n");
+process.stdout.write("1");
+' "${CONFIG_PATH}" "${key_path}"
+}
+
+cleanup_known_invalid_config_keys() {
+  local raw normalized paths
+  raw="$(oc config validate 2>&1 || true)"
+  normalized="${raw//\\n/$'\n'}"
+  paths="$(printf '%s\n' "${normalized}" | awk '
+/(unknown channel id:|plugin not found:)/ {
+  line=$0
+  sub(/^[[:space:]]*[×-]?[[:space:]]*/, "", line)
+  sub(/:.*/, "", line)
+  if (line != "") print line
+}
+' | sort -u)"
+  if [[ -z "${paths}" ]]; then
+    return
+  fi
+
+  local path removed_any
+  removed_any=0
+  while IFS= read -r path; do
+    [[ -z "${path}" ]] && continue
+    if [[ "$(remove_config_key_path "${path}")" == "1" ]]; then
+      echo "[init] removed invalid config key: ${path}"
+      removed_any=1
+    fi
+  done <<<"${paths}"
+
+  if [[ "${removed_any}" == "1" ]]; then
+    echo "[init] applied invalid-config cleanup from validate output"
+  fi
+}
+
+ensure_valid_config_for_startup() {
+  if oc config validate >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "[init] detected invalid config; running non-interactive doctor repair..."
+  if ! oc doctor --non-interactive --fix --yes >/dev/null 2>&1; then
+    echo "[warn] automatic doctor repair failed; continuing with best-effort startup."
+  fi
+
+  if oc config validate >/dev/null 2>&1; then
+    echo "[init] config repaired by doctor --fix"
+    return
+  fi
+
+  cleanup_known_invalid_config_keys
+  if oc config validate >/dev/null 2>&1; then
+    echo "[init] config repaired by key cleanup fallback"
+  else
+    echo "[warn] config still invalid after doctor --fix; continuing with best-effort startup."
   fi
 }
 
@@ -603,8 +706,40 @@ ensure_workspace_bootstrap() {
   if [[ -z "${workspace}" ]]; then
     workspace="${WORKSPACE_DIR}"
   fi
-  if ! oc setup --workspace "${workspace}" >/dev/null 2>&1; then
-    echo "[warn] failed to ensure workspace bootstrap files via 'openclaw setup --workspace ${workspace}'"
+  if oc setup --workspace "${workspace}" >/dev/null 2>&1; then
+    return
+  fi
+
+  if [[ -d "${RUNTIME_TEMPLATE_DIR}" ]]; then
+    mkdir -p "${workspace}"
+    local copied_any=0
+    local missing_any=0
+    local name src dst
+    for name in AGENTS.md BOOTSTRAP.md HEARTBEAT.md IDENTITY.md SOUL.md TOOLS.md USER.md; do
+      src="${RUNTIME_TEMPLATE_DIR}/${name}"
+      dst="${workspace}/${name}"
+      if [[ -f "${src}" && ! -f "${dst}" ]]; then
+        cp "${src}" "${dst}"
+        copied_any=1
+      fi
+      if [[ ! -f "${dst}" ]]; then
+        missing_any=1
+      fi
+    done
+    if [[ "${missing_any}" == "0" ]]; then
+      if [[ "${copied_any}" == "1" ]]; then
+        echo "[init] workspace bootstrap fallback applied from runtime templates"
+      fi
+      return
+    fi
+    if [[ "${copied_any}" == "1" ]]; then
+      echo "[init] workspace bootstrap fallback applied from runtime templates"
+    fi
+  fi
+
+  echo "[warn] failed to ensure workspace bootstrap files via 'openclaw setup --workspace ${workspace}'"
+  if [[ ! -d "${RUNTIME_TEMPLATE_DIR}" ]]; then
+    echo "[warn] runtime template dir not found: ${RUNTIME_TEMPLATE_DIR}"
   fi
 }
 
@@ -629,6 +764,7 @@ EOF
 }
 
 apply_base_config() {
+  ensure_valid_config_for_startup
   # Only fill defaults when keys are missing. Never overwrite imported custom config.
   set_config_default gateway.mode local
   set_config_default gateway.port 18789

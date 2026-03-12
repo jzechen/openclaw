@@ -79,6 +79,7 @@ function Get-BundledNodePath {
 }
 
 $NodeBin = Get-BundledNodePath
+$RuntimeTemplateDir = Join-Path $ScriptDir "bin\runtime\docs\reference\templates"
 
 function Merge-DirectoryIfPresent {
   param(
@@ -214,6 +215,114 @@ function Set-ConfigDefault {
   }
 }
 
+function Test-ConfigValid {
+  & $LocalOpenClaw config validate *> $null
+  return ($LASTEXITCODE -eq 0)
+}
+
+function Remove-ConfigKeyPath {
+  param([Parameter(Mandatory = $true)][string]$KeyPath)
+
+  $nodeScript = @'
+const fs=require("fs");
+const configPath=process.argv[1];
+const keyPath=process.argv[2];
+if (!configPath || !keyPath) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+let cfg;
+try {
+  cfg=JSON.parse(fs.readFileSync(configPath,"utf8"));
+} catch {
+  process.stdout.write("0");
+  process.exit(0);
+}
+const parts=keyPath.split(".").filter(Boolean);
+if (parts.length === 0) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+let obj=cfg;
+for (let i=0;i<parts.length-1;i++) {
+  const part=parts[i];
+  if (!obj || typeof obj !== "object" || !(part in obj)) {
+    process.stdout.write("0");
+    process.exit(0);
+  }
+  obj=obj[part];
+}
+const leaf=parts[parts.length-1];
+if (!obj || typeof obj !== "object" || !(leaf in obj)) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+delete obj[leaf];
+fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n");
+process.stdout.write("1");
+'@
+
+  $result = (Invoke-NodeEval -Script $nodeScript -Args @($ConfigPath, $KeyPath)).Trim()
+  return $result -eq "1"
+}
+
+function Cleanup-KnownInvalidConfigKeys {
+  $raw = (& $LocalOpenClaw config validate 2>&1 | ForEach-Object { "$_" }) -join "`n"
+  $normalized = $raw -replace '\\n', "`n"
+  $paths = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::Ordinal)
+
+  foreach ($line in ($normalized -split "`n")) {
+    if ($line -notmatch 'unknown channel id:|plugin not found:') {
+      continue
+    }
+    $key = ($line -replace '^[\s×-]*', '')
+    $idx = $key.IndexOf(':')
+    if ($idx -le 0) {
+      continue
+    }
+    $key = $key.Substring(0, $idx).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($key)) {
+      [void]$paths.Add($key)
+    }
+  }
+
+  $removedAny = $false
+  foreach ($key in $paths) {
+    if (Remove-ConfigKeyPath -KeyPath $key) {
+      Write-Host "[init] removed invalid config key: $key"
+      $removedAny = $true
+    }
+  }
+
+  if ($removedAny) {
+    Write-Host "[init] applied invalid-config cleanup from validate output"
+  }
+}
+
+function Ensure-ValidConfigForStartup {
+  if (Test-ConfigValid) {
+    return
+  }
+
+  Write-Host "[init] detected invalid config; running non-interactive doctor repair..."
+  & $LocalOpenClaw doctor --non-interactive --fix --yes *> $null
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warning "automatic doctor repair failed; continuing with best-effort startup."
+  }
+
+  if (Test-ConfigValid) {
+    Write-Host "[init] config repaired by doctor --fix"
+    return
+  }
+
+  Cleanup-KnownInvalidConfigKeys
+  if (Test-ConfigValid) {
+    Write-Host "[init] config repaired by key cleanup fallback"
+  } else {
+    Write-Warning "config still invalid after doctor --fix; continuing with best-effort startup."
+  }
+}
+
 function Ensure-GatewayToken {
   $hasToken = $false
   if (Test-Path $ConfigPath) {
@@ -250,8 +359,39 @@ function Get-ResolvedWorkspacePath {
 function Ensure-WorkspaceBootstrap {
   $workspace = Get-ResolvedWorkspacePath
   & $LocalOpenClaw setup --workspace $workspace *> $null
-  if ($LASTEXITCODE -ne 0) {
-    Write-Warning "failed to ensure workspace bootstrap files via 'openclaw setup --workspace $workspace'"
+  if ($LASTEXITCODE -eq 0) {
+    return
+  }
+
+  if (Test-Path -LiteralPath $RuntimeTemplateDir) {
+    New-Item -ItemType Directory -Path $workspace -Force | Out-Null
+    $copiedAny = $false
+    $missingAny = $false
+    foreach ($name in @("AGENTS.md", "BOOTSTRAP.md", "HEARTBEAT.md", "IDENTITY.md", "SOUL.md", "TOOLS.md", "USER.md")) {
+      $src = Join-Path $RuntimeTemplateDir $name
+      $dst = Join-Path $workspace $name
+      if ((Test-Path -LiteralPath $src) -and -not (Test-Path -LiteralPath $dst)) {
+        Copy-Item -LiteralPath $src -Destination $dst -Force
+        $copiedAny = $true
+      }
+      if (-not (Test-Path -LiteralPath $dst)) {
+        $missingAny = $true
+      }
+    }
+    if (-not $missingAny) {
+      if ($copiedAny) {
+        Write-Host "[init] workspace bootstrap fallback applied from runtime templates"
+      }
+      return
+    }
+    if ($copiedAny) {
+      Write-Host "[init] workspace bootstrap fallback applied from runtime templates"
+    }
+  }
+
+  Write-Warning "failed to ensure workspace bootstrap files via 'openclaw setup --workspace $workspace'"
+  if (-not (Test-Path -LiteralPath $RuntimeTemplateDir)) {
+    Write-Warning "runtime template dir not found: $RuntimeTemplateDir"
   }
 }
 
@@ -436,7 +576,7 @@ if (changed || oauthChanged) {
       Write-Host "[init] synced openai-codex OAuth credentials into state ($($Matches[1]) profile(s))"
     }
     '^no-codex-auth$' {
-      Write-Warning "$CodexHomeDir\auth.json not found; openai-codex OAuth may require re-login."
+      # Missing auth.json is expected on first-run or keychain-only setups.
     }
     '^no-codex-tokens$' {
       Write-Warning "$CodexHomeDir\auth.json is missing access/refresh tokens; openai-codex OAuth may fail."
@@ -490,6 +630,7 @@ function Print-ConfigValue {
 }
 
 function Apply-BaseConfig {
+  Ensure-ValidConfigForStartup
   # Only fill defaults when keys are missing. Never overwrite imported custom config.
   Set-ConfigDefault -Path "gateway.mode" -Value "local"
   Set-ConfigDefault -Path "gateway.port" -Value "18789"
