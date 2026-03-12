@@ -55,12 +55,14 @@ sea-macos: runtime-macos
 	@command -v node >/dev/null
 	@chmod +x $(DEPLOY_DIR)/build-sea-binary.sh
 	@./$(DEPLOY_DIR)/build-sea-binary.sh $(SEA_ARGS)
+	@cd $(DEPLOY_DIR) && tar -czf portable-runtime-mac.tgz bin/* usb-openclaw-mac.sh
 
 sea-win: runtime-win
 	@$(POWERSHELL) -NoProfile -ExecutionPolicy Bypass -File .\$(DEPLOY_DIR)\build-sea-binary.ps1 \
 		$(if $(filter 1,$(SEA_LITE)),-Lite,) \
 		$(if $(filter 1,$(SEA_STRIP_RUNTIME)),-StripRuntime,) \
 		$(if $(filter 1,$(SEA_KEEP_TEMP)),-KeepTemp,)
+	@$(POWERSHELL) -NoProfile -ExecutionPolicy Bypass -Command "tar -a -c -f .\deployment\openclaw-win-package.zip -C . deployment/bin deployment/usb-openclaw-win.ps1 deployment/usb-openclaw-win-native.ps1"
 
 package-macos: sea-macos
 	@mkdir -p $(DIST_DIR)
