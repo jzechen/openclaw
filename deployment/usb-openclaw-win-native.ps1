@@ -216,8 +216,32 @@ function Set-ConfigDefault {
 }
 
 function Test-ConfigValid {
-  & $LocalOpenClaw config validate *> $null
-  return ($LASTEXITCODE -eq 0)
+  if (-not (Test-Path -LiteralPath $ConfigPath)) {
+    return $false
+  }
+  $result = Invoke-ConfigValidateCapture
+  return ($result.ExitCode -eq 0)
+}
+
+function Invoke-ConfigValidateCapture {
+  $tmpOut = [System.IO.Path]::GetTempFileName()
+  try {
+    $launcherQuoted = '"' + $LocalOpenClaw.Replace('"', '""') + '"'
+    $tmpOutQuoted = '"' + $tmpOut.Replace('"', '""') + '"'
+    $validateCmd = "$launcherQuoted config validate >$tmpOutQuoted 2>&1"
+    & cmd /d /c $validateCmd | Out-Null
+    $exitCode = $LASTEXITCODE
+    $raw = ""
+    if (Test-Path -LiteralPath $tmpOut) {
+      $raw = Get-Content -LiteralPath $tmpOut -Raw -ErrorAction SilentlyContinue
+    }
+    return [PSCustomObject]@{
+      ExitCode = $exitCode
+      Output   = if ($null -eq $raw) { "" } else { [string]$raw }
+    }
+  } finally {
+    Remove-Item -LiteralPath $tmpOut -Force -ErrorAction SilentlyContinue
+  }
 }
 
 function Remove-ConfigKeyPath {
@@ -267,7 +291,7 @@ process.stdout.write("1");
 }
 
 function Cleanup-KnownInvalidConfigKeys {
-  $raw = (& $LocalOpenClaw config validate 2>&1 | ForEach-Object { "$_" }) -join "`n"
+  $raw = (Invoke-ConfigValidateCapture).Output
   $normalized = $raw -replace '\\n', "`n"
   $paths = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::Ordinal)
 
