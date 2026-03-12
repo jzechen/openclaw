@@ -17,6 +17,35 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$OpenClawBinDir = Join-Path $ScriptDir "bin"
+
+function Add-PathEntryIfMissing {
+  param([Parameter(Mandatory = $true)][string]$Entry)
+
+  $currentParts = @()
+  if (-not [string]::IsNullOrWhiteSpace($env:Path)) {
+    $currentParts = $env:Path.Split(";")
+  }
+
+  $exists = $false
+  foreach ($part in $currentParts) {
+    if ($part.TrimEnd('\') -ieq $Entry.TrimEnd('\')) {
+      $exists = $true
+      break
+    }
+  }
+
+  if (-not $exists) {
+    if ([string]::IsNullOrWhiteSpace($env:Path)) {
+      $env:Path = $Entry
+    } else {
+      $env:Path = "$Entry;$($env:Path)"
+    }
+  }
+}
+
+Add-PathEntryIfMissing -Entry $OpenClawBinDir
+
 if ([string]::IsNullOrWhiteSpace($UsbRoot)) {
   $UsbRoot = Join-Path $ScriptDir "data"
 }

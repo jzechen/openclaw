@@ -295,6 +295,7 @@ CODEX_HOME=./deployment/data/codex-home \
 - On startup, scripts migrate available config/state/workspace/codex-home into the default OpenClaw home (`~/.openclaw` or `%USERPROFILE%\.openclaw`) and default Codex home (`~/.codex` or `%USERPROFILE%\.codex`).
 - Scripts then run against the default paths (`openclaw.json` under default OpenClaw home) so CLI/app share one environment instead of isolated deployment-only state.
 - Scripts still set `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH`, and `CODEX_HOME` to those default locations for explicitness.
+- Scripts prepend `deployment/bin` to `PATH` for the current process and child processes, so `openclaw`/`openclaw.cmd` can be resolved by name during startup.
 - Scripts run `openclaw setup --workspace <resolved-workspace>` on startup to ensure bootstrap files exist (`AGENTS.md`, `SOUL.md`, `USER.md`, etc.) without overwriting existing files.
 - If both `MEMORY.md` and `memory.md` are absent, scripts create a starter `MEMORY.md`.
 - If `gateway.auth.token` is missing, scripts auto-generate one.

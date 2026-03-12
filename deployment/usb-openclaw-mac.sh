@@ -9,6 +9,7 @@ set -euo pipefail
 # - agents.defaults.model.primary=openai-codex/gpt-5.4
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OPENCLAW_BIN_DIR="${SCRIPT_DIR}/bin"
 
 ACTION="${1:-run}"
 DEFAULT_ROOT="${SCRIPT_DIR}/data"
@@ -19,6 +20,16 @@ CONFIG_ROOT_INPUT="${OPENCLAW_CONFIG_ROOT:-${SCRIPT_DIR}/config}"
 SOURCE_CODEX_HOME="${OPENCLAW_SOURCE_CODEX_HOME:-$HOME/.codex}"
 OPENCLAW_AUTO_CODEX_RELOGIN="${OPENCLAW_AUTO_CODEX_RELOGIN:-1}"
 OPENCLAW_CODEX_SOURCE_SYNC_MODE="${OPENCLAW_CODEX_SOURCE_SYNC_MODE:-if-missing}"
+
+prepend_path_if_missing() {
+  local dir="$1"
+  case ":${PATH}:" in
+    *":${dir}:"*) ;;
+    *) export PATH="${dir}:${PATH}" ;;
+  esac
+}
+
+prepend_path_if_missing "${OPENCLAW_BIN_DIR}"
 
 usage() {
   cat <<'USAGE'
