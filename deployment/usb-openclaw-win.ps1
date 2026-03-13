@@ -3,7 +3,7 @@ param(
 
   [string]$ConfigRoot,
 
-  [ValidateSet("init", "run", "status", "dashboard")]
+  [ValidateSet("init", "run", "run-bg", "stop", "status", "dashboard")]
   [string]$Action = "run",
 
   [ValidateSet("native", "wsl")]
@@ -17,6 +17,35 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$OpenClawBinDir = Join-Path $ScriptDir "bin"
+
+function Add-PathEntryIfMissing {
+  param([Parameter(Mandatory = $true)][string]$Entry)
+
+  $currentParts = @()
+  if (-not [string]::IsNullOrWhiteSpace($env:Path)) {
+    $currentParts = $env:Path.Split(";")
+  }
+
+  $exists = $false
+  foreach ($part in $currentParts) {
+    if ($part.TrimEnd('\') -ieq $Entry.TrimEnd('\')) {
+      $exists = $true
+      break
+    }
+  }
+
+  if (-not $exists) {
+    if ([string]::IsNullOrWhiteSpace($env:Path)) {
+      $env:Path = $Entry
+    } else {
+      $env:Path = "$Entry;$($env:Path)"
+    }
+  }
+}
+
+Add-PathEntryIfMissing -Entry $OpenClawBinDir
+
 if ([string]::IsNullOrWhiteSpace($UsbRoot)) {
   $UsbRoot = Join-Path $ScriptDir "data"
 }
@@ -81,7 +110,7 @@ if ($WslConfigRoot) {
 
 wsl -d $Distro -- chmod +x "$WslScript"
 $WslArgs = @($Action, $WslUsbRoot)
-if ($Dashboard -and $Action -eq "run") {
+if ($Dashboard -and ($Action -eq "run" -or $Action -eq "run-bg")) {
   $WslArgs += "dashboard"
 }
 

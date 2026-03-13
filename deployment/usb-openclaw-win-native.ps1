@@ -3,7 +3,7 @@ param(
 
   [string]$ConfigRoot,
 
-  [ValidateSet("init", "run", "status", "dashboard")]
+  [ValidateSet("init", "run", "run-bg", "stop", "status", "dashboard")]
   [string]$Action = "run",
 
   [switch]$Dashboard
@@ -12,6 +12,35 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$OpenClawBinDir = Join-Path $ScriptDir "bin"
+
+function Add-PathEntryIfMissing {
+  param([Parameter(Mandatory = $true)][string]$Entry)
+
+  $currentParts = @()
+  if (-not [string]::IsNullOrWhiteSpace($env:Path)) {
+    $currentParts = $env:Path.Split(";")
+  }
+
+  $exists = $false
+  foreach ($part in $currentParts) {
+    if ($part.TrimEnd('\') -ieq $Entry.TrimEnd('\')) {
+      $exists = $true
+      break
+    }
+  }
+
+  if (-not $exists) {
+    if ([string]::IsNullOrWhiteSpace($env:Path)) {
+      $env:Path = $Entry
+    } else {
+      $env:Path = "$Entry;$($env:Path)"
+    }
+  }
+}
+
+Add-PathEntryIfMissing -Entry $OpenClawBinDir
+
 if ([string]::IsNullOrWhiteSpace($UsbRoot)) {
   $UsbRoot = Join-Path $ScriptDir "data"
 }
@@ -50,15 +79,55 @@ function Get-BundledNodePath {
 }
 
 $NodeBin = Get-BundledNodePath
+$RuntimeTemplateDir = Join-Path $ScriptDir "bin\runtime\docs\reference\templates"
 
-$StateDir = Join-Path $UsbRoot "state-win"
-$ConfigPath = Join-Path $ConfigRoot "openclaw-win.json"
-$WorkspaceDir = Join-Path $UsbRoot "workspace"
-$CodexHomeDir = Join-Path $UsbRoot "codex-home"
+function Merge-DirectoryIfPresent {
+  param(
+    [Parameter(Mandatory = $true)][string]$Source,
+    [Parameter(Mandatory = $true)][string]$Destination,
+    [Parameter(Mandatory = $true)][string]$Label
+  )
+
+  if (-not (Test-Path -LiteralPath $Source)) {
+    return
+  }
+  New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+
+  $RoboCopy = Get-Command robocopy -ErrorAction SilentlyContinue
+  if ($RoboCopy) {
+    & robocopy $Source $Destination /E /R:2 /W:1 /XC /XN /XO /NFL /NDL /NJH /NJS /NP | Out-Null
+    $RoboCode = $LASTEXITCODE
+    if ($RoboCode -gt 7) {
+      throw "robocopy migrate failed for $Label with exit code $RoboCode"
+    }
+  }
+  Write-Host "[migrate] merged ${Label}: $Source -> $Destination"
+}
+
+$SourceStateDir = Join-Path $UsbRoot "state-win"
+$SourceConfigPath = Join-Path $ConfigRoot "openclaw-win.json"
+$SourceWorkspaceDir = Join-Path $UsbRoot "workspace"
+$SourceCodexHomeDir = Join-Path $UsbRoot "codex-home"
+
+$DefaultOpenClawHome = Join-Path $HOME ".openclaw"
+$DefaultCodexHome = Join-Path $HOME ".codex"
+
+$StateDir = $DefaultOpenClawHome
+$ConfigPath = Join-Path $DefaultOpenClawHome "openclaw.json"
+$WorkspaceDir = Join-Path $DefaultOpenClawHome "workspace"
+$CodexHomeDir = $DefaultCodexHome
 
 New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
 New-Item -ItemType Directory -Path $WorkspaceDir -Force | Out-Null
 New-Item -ItemType Directory -Path $CodexHomeDir -Force | Out-Null
+
+if ((Test-Path -LiteralPath $SourceConfigPath) -and -not (Test-Path -LiteralPath $ConfigPath)) {
+  Copy-Item -Path $SourceConfigPath -Destination $ConfigPath -Force
+  Write-Host "[migrate] copied config: $SourceConfigPath -> $ConfigPath"
+}
+Merge-DirectoryIfPresent -Source $SourceStateDir -Destination $StateDir -Label "state"
+Merge-DirectoryIfPresent -Source $SourceWorkspaceDir -Destination $WorkspaceDir -Label "workspace"
+Merge-DirectoryIfPresent -Source $SourceCodexHomeDir -Destination $CodexHomeDir -Label "codex-home"
 
 $env:OPENCLAW_STATE_DIR = $StateDir
 $env:OPENCLAW_CONFIG_PATH = $ConfigPath
@@ -146,6 +215,138 @@ function Set-ConfigDefault {
   }
 }
 
+function Test-ConfigValid {
+  if (-not (Test-Path -LiteralPath $ConfigPath)) {
+    return $false
+  }
+  $result = Invoke-ConfigValidateCapture
+  return ($result.ExitCode -eq 0)
+}
+
+function Invoke-ConfigValidateCapture {
+  $tmpOut = [System.IO.Path]::GetTempFileName()
+  try {
+    $launcherQuoted = '"' + $LocalOpenClaw.Replace('"', '""') + '"'
+    $tmpOutQuoted = '"' + $tmpOut.Replace('"', '""') + '"'
+    $validateCmd = "$launcherQuoted config validate >$tmpOutQuoted 2>&1"
+    & cmd /d /c $validateCmd | Out-Null
+    $exitCode = $LASTEXITCODE
+    $raw = ""
+    if (Test-Path -LiteralPath $tmpOut) {
+      $raw = Get-Content -LiteralPath $tmpOut -Raw -ErrorAction SilentlyContinue
+    }
+    return [PSCustomObject]@{
+      ExitCode = $exitCode
+      Output   = if ($null -eq $raw) { "" } else { [string]$raw }
+    }
+  } finally {
+    Remove-Item -LiteralPath $tmpOut -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Remove-ConfigKeyPath {
+  param([Parameter(Mandatory = $true)][string]$KeyPath)
+
+  $nodeScript = @'
+const fs=require("fs");
+const configPath=process.argv[1];
+const keyPath=process.argv[2];
+if (!configPath || !keyPath) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+let cfg;
+try {
+  cfg=JSON.parse(fs.readFileSync(configPath,"utf8"));
+} catch {
+  process.stdout.write("0");
+  process.exit(0);
+}
+const parts=keyPath.split(".").filter(Boolean);
+if (parts.length === 0) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+let obj=cfg;
+for (let i=0;i<parts.length-1;i++) {
+  const part=parts[i];
+  if (!obj || typeof obj !== "object" || !(part in obj)) {
+    process.stdout.write("0");
+    process.exit(0);
+  }
+  obj=obj[part];
+}
+const leaf=parts[parts.length-1];
+if (!obj || typeof obj !== "object" || !(leaf in obj)) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+delete obj[leaf];
+fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n");
+process.stdout.write("1");
+'@
+
+  $result = (Invoke-NodeEval -Script $nodeScript -Args @($ConfigPath, $KeyPath)).Trim()
+  return $result -eq "1"
+}
+
+function Cleanup-KnownInvalidConfigKeys {
+  $raw = (Invoke-ConfigValidateCapture).Output
+  $normalized = $raw -replace '\\n', "`n"
+  $paths = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::Ordinal)
+
+  foreach ($line in ($normalized -split "`n")) {
+    if ($line -notmatch 'unknown channel id:|plugin not found:') {
+      continue
+    }
+    $key = ($line -replace '^[\s×-]*', '')
+    $idx = $key.IndexOf(':')
+    if ($idx -le 0) {
+      continue
+    }
+    $key = $key.Substring(0, $idx).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($key)) {
+      [void]$paths.Add($key)
+    }
+  }
+
+  $removedAny = $false
+  foreach ($key in $paths) {
+    if (Remove-ConfigKeyPath -KeyPath $key) {
+      Write-Host "[init] removed invalid config key: $key"
+      $removedAny = $true
+    }
+  }
+
+  if ($removedAny) {
+    Write-Host "[init] applied invalid-config cleanup from validate output"
+  }
+}
+
+function Ensure-ValidConfigForStartup {
+  if (Test-ConfigValid) {
+    return
+  }
+
+  Write-Host "[init] detected invalid config; running non-interactive doctor repair..."
+  & $LocalOpenClaw doctor --non-interactive --fix --yes *> $null
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warning "automatic doctor repair failed; continuing with best-effort startup."
+  }
+
+  if (Test-ConfigValid) {
+    Write-Host "[init] config repaired by doctor --fix"
+    return
+  }
+
+  Cleanup-KnownInvalidConfigKeys
+  if (Test-ConfigValid) {
+    Write-Host "[init] config repaired by key cleanup fallback"
+  } else {
+    Write-Warning "config still invalid after doctor --fix; continuing with best-effort startup."
+  }
+}
+
 function Ensure-GatewayToken {
   $hasToken = $false
   if (Test-Path $ConfigPath) {
@@ -182,8 +383,39 @@ function Get-ResolvedWorkspacePath {
 function Ensure-WorkspaceBootstrap {
   $workspace = Get-ResolvedWorkspacePath
   & $LocalOpenClaw setup --workspace $workspace *> $null
-  if ($LASTEXITCODE -ne 0) {
-    Write-Warning "failed to ensure workspace bootstrap files via 'openclaw setup --workspace $workspace'"
+  if ($LASTEXITCODE -eq 0) {
+    return
+  }
+
+  if (Test-Path -LiteralPath $RuntimeTemplateDir) {
+    New-Item -ItemType Directory -Path $workspace -Force | Out-Null
+    $copiedAny = $false
+    $missingAny = $false
+    foreach ($name in @("AGENTS.md", "BOOTSTRAP.md", "HEARTBEAT.md", "IDENTITY.md", "SOUL.md", "TOOLS.md", "USER.md")) {
+      $src = Join-Path $RuntimeTemplateDir $name
+      $dst = Join-Path $workspace $name
+      if ((Test-Path -LiteralPath $src) -and -not (Test-Path -LiteralPath $dst)) {
+        Copy-Item -LiteralPath $src -Destination $dst -Force
+        $copiedAny = $true
+      }
+      if (-not (Test-Path -LiteralPath $dst)) {
+        $missingAny = $true
+      }
+    }
+    if (-not $missingAny) {
+      if ($copiedAny) {
+        Write-Host "[init] workspace bootstrap fallback applied from runtime templates"
+      }
+      return
+    }
+    if ($copiedAny) {
+      Write-Host "[init] workspace bootstrap fallback applied from runtime templates"
+    }
+  }
+
+  Write-Warning "failed to ensure workspace bootstrap files via 'openclaw setup --workspace $workspace'"
+  if (-not (Test-Path -LiteralPath $RuntimeTemplateDir)) {
+    Write-Warning "runtime template dir not found: $RuntimeTemplateDir"
   }
 }
 
@@ -368,7 +600,7 @@ if (changed || oauthChanged) {
       Write-Host "[init] synced openai-codex OAuth credentials into state ($($Matches[1]) profile(s))"
     }
     '^no-codex-auth$' {
-      Write-Warning "$CodexHomeDir\auth.json not found; openai-codex OAuth may require re-login."
+      # Missing auth.json is expected on first-run or keychain-only setups.
     }
     '^no-codex-tokens$' {
       Write-Warning "$CodexHomeDir\auth.json is missing access/refresh tokens; openai-codex OAuth may fail."
@@ -414,18 +646,15 @@ function Print-DashboardHint {
 
 function Print-ConfigValue {
   param([string]$Path)
-  $output = & $LocalOpenClaw config get $Path 2>$null
-  if ($LASTEXITCODE -ne 0) {
+  $value = Get-ConfigValue -Path $Path
+  if ($null -eq $value) {
     return "(unset)"
   }
-  $line = (($output | ForEach-Object { "$_" }) | Select-Object -Last 1)
-  if ([string]::IsNullOrWhiteSpace($line)) {
-    return "(unset)"
-  }
-  return $line.Trim()
+  return "$value"
 }
 
 function Apply-BaseConfig {
+  Ensure-ValidConfigForStartup
   # Only fill defaults when keys are missing. Never overwrite imported custom config.
   Set-ConfigDefault -Path "gateway.mode" -Value "local"
   Set-ConfigDefault -Path "gateway.port" -Value "18789"
@@ -454,6 +683,72 @@ function Print-Status {
   Write-Host (Print-ConfigValue -Path "agents.defaults.model.primary")
 }
 
+function Start-GatewayBackground {
+  $logDir = Join-Path $StateDir "logs"
+  $stdoutLog = Join-Path $logDir "gateway.log"
+  $stderrLog = Join-Path $logDir "gateway.err.log"
+  $pidFile = Join-Path $StateDir "gateway.pid"
+  New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+
+  $proc = Start-Process -FilePath $LocalOpenClaw -ArgumentList @("gateway", "run") -WorkingDirectory $ScriptDir -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+  Set-Content -LiteralPath $pidFile -Value "$($proc.Id)" -Encoding ASCII
+  Write-Host "[run-bg] gateway started in background (pid=$($proc.Id))"
+  Write-Host "[run-bg] pid file: $pidFile"
+  Write-Host "[run-bg] stdout log: $stdoutLog"
+  Write-Host "[run-bg] stderr log: $stderrLog"
+}
+
+function Stop-GatewayBackground {
+  $pidFile = Join-Path $StateDir "gateway.pid"
+  $stoppedAny = $false
+
+  if (Test-Path -LiteralPath $pidFile) {
+    $rawPid = (Get-Content -LiteralPath $pidFile -Raw -ErrorAction SilentlyContinue).Trim()
+    $parsedPid = 0
+    if ([int]::TryParse($rawPid, [ref]$parsedPid) -and $parsedPid -gt 0) {
+      try {
+        $proc = Get-Process -Id $parsedPid -ErrorAction Stop
+        Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+        Write-Host "[stop] stopped gateway pid=$parsedPid (from pid file)"
+        $stoppedAny = $true
+      } catch {
+        Write-Host "[stop] pid file exists but process not running: $parsedPid"
+      }
+    }
+    Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+  }
+
+  # Fallback: stop orphaned background gateway processes started from this deployment.
+  $scriptDirLower = $ScriptDir.ToLowerInvariant()
+  $candidates = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+      if ([string]::IsNullOrWhiteSpace($_.CommandLine)) {
+        return $false
+      }
+      $cmd = $_.CommandLine.ToLowerInvariant()
+      $isGatewayRun = $cmd -match '(^|\s)gateway\s+run(\s|$)'
+      $isDeploymentProcess = $cmd.Contains($scriptDirLower) -or $cmd.Contains('\deployment\bin\openclaw.cmd') -or $cmd.Contains('\deployment\bin\runtime\openclaw.mjs')
+      return $isGatewayRun -and $isDeploymentProcess
+    }
+
+  foreach ($candidate in $candidates) {
+    if (-not $candidate.ProcessId) {
+      continue
+    }
+    try {
+      Stop-Process -Id $candidate.ProcessId -Force -ErrorAction Stop
+      Write-Host "[stop] stopped orphan gateway pid=$($candidate.ProcessId)"
+      $stoppedAny = $true
+    } catch {
+      # ignore races where process has already exited
+    }
+  }
+
+  if (-not $stoppedAny) {
+    Write-Host "[stop] no running background gateway process found"
+  }
+}
+
 switch ($Action) {
   "init" {
     Apply-BaseConfig
@@ -467,6 +762,17 @@ switch ($Action) {
     }
     Invoke-OpenClaw gateway run
   }
+  "run-bg" {
+    Apply-BaseConfig
+    Print-Status
+    if ($Dashboard) {
+      Print-DashboardHint -OpenInBrowser
+    }
+    Start-GatewayBackground
+  }
+  "stop" {
+    Stop-GatewayBackground
+  }
   "dashboard" {
     Apply-BaseConfig
     Print-DashboardHint -OpenInBrowser
@@ -475,3 +781,5 @@ switch ($Action) {
     Print-Status
   }
 }
+
+exit 0

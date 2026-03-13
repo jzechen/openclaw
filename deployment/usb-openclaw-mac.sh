@@ -9,6 +9,7 @@ set -euo pipefail
 # - agents.defaults.model.primary=openai-codex/gpt-5.4
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OPENCLAW_BIN_DIR="${SCRIPT_DIR}/bin"
 
 ACTION="${1:-run}"
 DEFAULT_ROOT="${SCRIPT_DIR}/data"
@@ -20,20 +21,32 @@ SOURCE_CODEX_HOME="${OPENCLAW_SOURCE_CODEX_HOME:-$HOME/.codex}"
 OPENCLAW_AUTO_CODEX_RELOGIN="${OPENCLAW_AUTO_CODEX_RELOGIN:-1}"
 OPENCLAW_CODEX_SOURCE_SYNC_MODE="${OPENCLAW_CODEX_SOURCE_SYNC_MODE:-if-missing}"
 
+prepend_path_if_missing() {
+  local dir="$1"
+  case ":${PATH}:" in
+    *":${dir}:"*) ;;
+    *) export PATH="${dir}:${PATH}" ;;
+  esac
+}
+
+prepend_path_if_missing "${OPENCLAW_BIN_DIR}"
+
 usage() {
   cat <<'USAGE'
 Usage:
-  usb-openclaw-mac.sh <init|run|status|dashboard> [data_root_path] [dashboard]
+  usb-openclaw-mac.sh <init|run|run-bg|stop|status|dashboard> [data_root_path] [dashboard]
 
 Examples:
   ./deployment/usb-openclaw-mac.sh init
   ./deployment/usb-openclaw-mac.sh run
+  ./deployment/usb-openclaw-mac.sh run-bg
+  ./deployment/usb-openclaw-mac.sh stop
   ./deployment/usb-openclaw-mac.sh run ./deployment/data dashboard
   ./deployment/usb-openclaw-mac.sh dashboard
 USAGE
 }
 
-if [[ "${ACTION}" == "run" ]]; then
+if [[ "${ACTION}" == "run" || "${ACTION}" == "run-bg" ]]; then
   if [[ "${USB_ROOT_INPUT}" == "dashboard" ]]; then
     USB_ROOT_INPUT="${OPENCLAW_USB_ROOT:-${DEFAULT_ROOT}}"
     OPEN_DASHBOARD_ON_RUN=true
@@ -82,12 +95,67 @@ oc() {
   "${LOCAL_OPENCLAW}" "$@"
 }
 
-STATE_DIR="${USB_ROOT}/state-mac"
-CONFIG_PATH="${CONFIG_ROOT}/openclaw-mac.json"
-WORKSPACE_DIR="${USB_ROOT}/workspace"
-CODEX_HOME_DIR="${USB_ROOT}/codex-home"
+SOURCE_STATE_DIR="${USB_ROOT}/state-mac"
+SOURCE_CONFIG_PATH="${CONFIG_ROOT}/openclaw-mac.json"
+SOURCE_WORKSPACE_DIR="${USB_ROOT}/workspace"
+SOURCE_CODEX_HOME_DIR="${USB_ROOT}/codex-home"
+RUNTIME_TEMPLATE_DIR_DEFAULT="${SCRIPT_DIR}/bin/runtime/docs/reference/templates"
+
+DEFAULT_OPENCLAW_HOME="${HOME}/.openclaw"
+DEFAULT_CODEX_HOME="${HOME}/.codex"
+
+STATE_DIR="${DEFAULT_OPENCLAW_HOME}"
+CONFIG_PATH="${DEFAULT_OPENCLAW_HOME}/openclaw.json"
+WORKSPACE_DIR="${DEFAULT_OPENCLAW_HOME}/workspace"
+CODEX_HOME_DIR="${DEFAULT_CODEX_HOME}"
+CONFIG_ROOT="${DEFAULT_OPENCLAW_HOME}"
+
+resolve_runtime_template_dir() {
+  local candidate
+  for candidate in \
+    "${SCRIPT_DIR}/bin/runtime/docs/reference/templates" \
+    "${SCRIPT_DIR}/docs/reference/templates" \
+    "${SCRIPT_DIR}/../docs/reference/templates"; do
+    if [[ -d "${candidate}" ]]; then
+      echo "${candidate}"
+      return
+    fi
+  done
+  echo "${RUNTIME_TEMPLATE_DIR_DEFAULT}"
+}
+
+RUNTIME_TEMPLATE_DIR="$(resolve_runtime_template_dir)"
 
 mkdir -p "${STATE_DIR}" "${WORKSPACE_DIR}" "${CODEX_HOME_DIR}"
+
+merge_dir_if_present() {
+  local src="$1"
+  local dst="$2"
+  local label="$3"
+  if [[ ! -d "${src}" ]]; then
+    return
+  fi
+  mkdir -p "${dst}"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --ignore-existing "${src}/" "${dst}/"
+  else
+    cp -R -n "${src}/." "${dst}/"
+  fi
+  echo "[migrate] merged ${label}: ${src} -> ${dst}"
+}
+
+migrate_to_default_home() {
+  if [[ -f "${SOURCE_CONFIG_PATH}" && ! -f "${CONFIG_PATH}" ]]; then
+    mkdir -p "$(dirname "${CONFIG_PATH}")"
+    cp "${SOURCE_CONFIG_PATH}" "${CONFIG_PATH}"
+    echo "[migrate] copied config: ${SOURCE_CONFIG_PATH} -> ${CONFIG_PATH}"
+  fi
+  merge_dir_if_present "${SOURCE_STATE_DIR}" "${STATE_DIR}" "state"
+  merge_dir_if_present "${SOURCE_WORKSPACE_DIR}" "${WORKSPACE_DIR}" "workspace"
+  merge_dir_if_present "${SOURCE_CODEX_HOME_DIR}" "${CODEX_HOME_DIR}" "codex-home"
+}
+
+migrate_to_default_home
 
 export OPENCLAW_STATE_DIR="${STATE_DIR}"
 export OPENCLAW_CONFIG_PATH="${CONFIG_PATH}"
@@ -366,7 +434,8 @@ if (changed || oauthChanged) {
       echo "[init] synced openai-codex OAuth credentials into state (${result#updated:} profile(s))"
       ;;
     no-codex-auth)
-      echo "[warn] ${CODEX_HOME_DIR}/auth.json not found; openai-codex OAuth may require re-login."
+      # Missing auth.json is expected on first-run or keychain-only setups.
+      :
       ;;
     no-codex-tokens)
       echo "[warn] ${CODEX_HOME_DIR}/auth.json is missing access/refresh tokens; openai-codex OAuth may fail."
@@ -493,8 +562,13 @@ ensure_gateway_token() {
   if [[ "${has_token}" != "1" ]]; then
     local token
     token="$(generate_token)"
-    oc config set gateway.auth.token "${token}" >/dev/null
-    echo "[init] generated gateway.auth.token in ${CONFIG_PATH}"
+    if oc config set gateway.auth.token "${token}" >/dev/null 2>&1; then
+      echo "[init] generated gateway.auth.token in ${CONFIG_PATH}"
+    elif [[ "$(set_config_value_direct gateway.auth.token "${token}")" == "1" ]]; then
+      echo "[init] generated gateway.auth.token in ${CONFIG_PATH} (direct write fallback)"
+    else
+      echo "[warn] failed to generate gateway.auth.token automatically"
+    fi
   fi
   local resolved_token
   resolved_token="$(read_gateway_token)"
@@ -536,13 +610,185 @@ try{
 }' "${CONFIG_PATH}" "${key}"
 }
 
+set_config_value_direct() {
+  local key="$1"
+  local raw_value="$2"
+  node_eval '
+const fs=require("fs");
+const path=require("path");
+const [configPath,key,rawValue]=process.argv.slice(1);
+if (!configPath || !key) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+const parseConfig=(raw)=>{
+  try {
+    return JSON.parse(raw);
+  } catch {
+    try {
+      const json5=require("json5");
+      return json5.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+};
+let cfg={};
+if (fs.existsSync(configPath)) {
+  let parsed=null;
+  try {
+    parsed=parseConfig(fs.readFileSync(configPath,"utf8"));
+  } catch {
+    parsed=null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    process.stdout.write("0");
+    process.exit(0);
+  }
+  cfg=parsed;
+}
+const parts=key.split(".").filter(Boolean);
+if (parts.length === 0) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+let cursor=cfg;
+for (let i=0;i<parts.length-1;i++) {
+  const part=parts[i];
+  const next=cursor[part];
+  if (!next || typeof next !== "object" || Array.isArray(next)) {
+    cursor[part]={};
+  }
+  cursor=cursor[part];
+}
+const leaf=parts[parts.length-1];
+let value=rawValue;
+if (rawValue === "true") {
+  value=true;
+} else if (rawValue === "false") {
+  value=false;
+} else if (/^-?[0-9]+$/.test(rawValue)) {
+  const parsedInt=Number(rawValue);
+  if (Number.isSafeInteger(parsedInt)) {
+    value=parsedInt;
+  }
+}
+cursor[leaf]=value;
+fs.mkdirSync(path.dirname(configPath), { recursive: true });
+fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n");
+process.stdout.write("1");
+' "${CONFIG_PATH}" "${key}" "${raw_value}"
+}
+
 set_config_default() {
   local key="$1"
   local value="$2"
   local present
   present="$(config_value_present "${key}")"
   if [[ "${present}" != "1" ]]; then
-    oc config set "${key}" "${value}" >/dev/null
+    if ! oc config set "${key}" "${value}" >/dev/null 2>&1; then
+      if [[ "$(set_config_value_direct "${key}" "${value}")" == "1" ]]; then
+        echo "[init] wrote default config '${key}' via direct fallback"
+      else
+        echo "[warn] failed to set default config '${key}' (config may still be invalid)"
+      fi
+    fi
+  fi
+}
+
+remove_config_key_path() {
+  local key_path="$1"
+  node_eval '
+const fs=require("fs");
+const configPath=process.argv[1];
+const keyPath=process.argv[2];
+if (!configPath || !keyPath) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+let cfg;
+try {
+  cfg=JSON.parse(fs.readFileSync(configPath,"utf8"));
+} catch {
+  process.stdout.write("0");
+  process.exit(0);
+}
+const parts=keyPath.split(".").filter(Boolean);
+if (parts.length === 0) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+let obj=cfg;
+for (let i=0;i<parts.length-1;i++) {
+  const part=parts[i];
+  if (!obj || typeof obj !== "object" || !(part in obj)) {
+    process.stdout.write("0");
+    process.exit(0);
+  }
+  obj=obj[part];
+}
+const leaf=parts[parts.length-1];
+if (!obj || typeof obj !== "object" || !(leaf in obj)) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+delete obj[leaf];
+fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n");
+process.stdout.write("1");
+' "${CONFIG_PATH}" "${key_path}"
+}
+
+cleanup_known_invalid_config_keys() {
+  local raw normalized paths
+  raw="$(oc config validate 2>&1 || true)"
+  normalized="${raw//\\n/$'\n'}"
+  paths="$(printf '%s\n' "${normalized}" | awk '
+/(unknown channel id:|plugin not found:)/ {
+  line=$0
+  sub(/^[[:space:]]*[×-]?[[:space:]]*/, "", line)
+  sub(/:.*/, "", line)
+  if (line != "") print line
+}
+' | sort -u)"
+  if [[ -z "${paths}" ]]; then
+    return
+  fi
+
+  local path removed_any
+  removed_any=0
+  while IFS= read -r path; do
+    [[ -z "${path}" ]] && continue
+    if [[ "$(remove_config_key_path "${path}")" == "1" ]]; then
+      echo "[init] removed invalid config key: ${path}"
+      removed_any=1
+    fi
+  done <<<"${paths}"
+
+  if [[ "${removed_any}" == "1" ]]; then
+    echo "[init] applied invalid-config cleanup from validate output"
+  fi
+}
+
+ensure_valid_config_for_startup() {
+  if oc config validate >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "[init] detected invalid config; running non-interactive doctor repair..."
+  if ! oc doctor --non-interactive --fix --yes >/dev/null 2>&1; then
+    echo "[warn] automatic doctor repair failed; continuing with best-effort startup."
+  fi
+
+  if oc config validate >/dev/null 2>&1; then
+    echo "[init] config repaired by doctor --fix"
+    return
+  fi
+
+  cleanup_known_invalid_config_keys
+  if oc config validate >/dev/null 2>&1; then
+    echo "[init] config repaired by key cleanup fallback"
+  else
+    echo "[warn] config still invalid after doctor --fix; continuing with best-effort startup."
   fi
 }
 
@@ -552,8 +798,52 @@ ensure_workspace_bootstrap() {
   if [[ -z "${workspace}" ]]; then
     workspace="${WORKSPACE_DIR}"
   fi
-  if ! oc setup --workspace "${workspace}" >/dev/null 2>&1; then
-    echo "[warn] failed to ensure workspace bootstrap files via 'openclaw setup --workspace ${workspace}'"
+  if oc setup --workspace "${workspace}" >/dev/null 2>&1; then
+    return
+  fi
+
+  if [[ -d "${RUNTIME_TEMPLATE_DIR}" ]]; then
+    mkdir -p "${workspace}"
+    local copied_any=0
+    local missing_any=0
+    local name src dst
+    for name in AGENTS.md BOOTSTRAP.md HEARTBEAT.md IDENTITY.md SOUL.md TOOLS.md USER.md; do
+      src="${RUNTIME_TEMPLATE_DIR}/${name}"
+      dst="${workspace}/${name}"
+      if [[ -f "${src}" && ! -f "${dst}" ]]; then
+        cp "${src}" "${dst}"
+        copied_any=1
+      fi
+      if [[ ! -f "${dst}" ]]; then
+        missing_any=1
+      fi
+    done
+    if [[ "${missing_any}" == "0" ]]; then
+      if [[ "${copied_any}" == "1" ]]; then
+        echo "[init] workspace bootstrap fallback applied from runtime templates"
+      fi
+      return
+    fi
+    if [[ "${copied_any}" == "1" ]]; then
+      echo "[init] workspace bootstrap fallback applied from runtime templates"
+    fi
+  fi
+
+  local name missing_any
+  missing_any=0
+  for name in AGENTS.md BOOTSTRAP.md HEARTBEAT.md IDENTITY.md SOUL.md TOOLS.md USER.md; do
+    if [[ ! -f "${workspace}/${name}" ]]; then
+      missing_any=1
+      break
+    fi
+  done
+  if [[ "${missing_any}" == "0" ]]; then
+    return
+  fi
+
+  echo "[warn] failed to ensure workspace bootstrap files via 'openclaw setup --workspace ${workspace}'"
+  if [[ ! -d "${RUNTIME_TEMPLATE_DIR}" ]]; then
+    echo "[warn] runtime template dir not found: ${RUNTIME_TEMPLATE_DIR}"
   fi
 }
 
@@ -578,6 +868,7 @@ EOF
 }
 
 apply_base_config() {
+  # ensure_valid_config_for_startup
   # Only fill defaults when keys are missing. Never overwrite imported custom config.
   set_config_default gateway.mode local
   set_config_default gateway.port 18789
@@ -616,7 +907,10 @@ print_dashboard_hint() {
 print_config_value() {
   local key="$1"
   local value
-  value="$(oc config get "${key}" 2>/dev/null | tail -n 1 || true)"
+  value="$(read_config_value "${key}")"
+  if [[ -z "${value}" ]]; then
+    value="$(oc config get "${key}" 2>/dev/null | tail -n 1 || true)"
+  fi
   if [[ -z "${value}" ]]; then
     echo "(unset)"
     return
@@ -638,6 +932,97 @@ print_status() {
   print_config_value agents.defaults.model.primary
 }
 
+start_gateway_background() {
+  local log_dir log_file pid_file
+  log_dir="${STATE_DIR}/logs"
+  log_file="${log_dir}/gateway.log"
+  pid_file="${STATE_DIR}/gateway.pid"
+  mkdir -p "${log_dir}"
+  nohup "${LOCAL_OPENCLAW}" gateway run >"${log_file}" 2>&1 &
+  echo $! >"${pid_file}"
+  echo "[run-bg] gateway started in background (pid=$(cat "${pid_file}"))"
+  echo "[run-bg] log: ${log_file}"
+}
+
+stop_gateway_background() {
+  local pid_file
+  pid_file="${STATE_DIR}/gateway.pid"
+  local stopped_any=0
+
+  # Preferred path: let OpenClaw stop managed/unmanaged gateway instances.
+  if oc gateway stop >/dev/null 2>&1; then
+    echo "[stop] requested gateway stop via openclaw gateway stop"
+    stopped_any=1
+  fi
+
+  if [[ -f "${pid_file}" ]]; then
+    local pid
+    pid="$(cat "${pid_file}" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
+      kill "${pid}" >/dev/null 2>&1 || true
+      sleep 1
+      if kill -0 "${pid}" >/dev/null 2>&1; then
+        kill -9 "${pid}" >/dev/null 2>&1 || true
+      fi
+      echo "[stop] stopped gateway pid=${pid}"
+      stopped_any=1
+    fi
+    rm -f "${pid_file}"
+  fi
+
+  # Fallback: stop orphaned background runs not tracked by pid file.
+  local pids
+  pids="$(
+    {
+      pgrep -f "${LOCAL_OPENCLAW} gateway run" 2>/dev/null || true
+      pgrep -f "${SCRIPT_DIR}/bin/runtime/openclaw.mjs gateway run" 2>/dev/null || true
+    } | awk '!seen[$0]++'
+  )"
+  if [[ -n "${pids}" ]]; then
+    while IFS= read -r p; do
+      [[ -z "${p}" ]] && continue
+      kill "${p}" >/dev/null 2>&1 || true
+      sleep 1
+      if kill -0 "${p}" >/dev/null 2>&1; then
+        kill -9 "${p}" >/dev/null 2>&1 || true
+      fi
+      echo "[stop] stopped orphan gateway pid=${p}"
+      stopped_any=1
+    done <<<"${pids}"
+  fi
+
+  # Fallback: stop openclaw listeners on configured gateway port.
+  local port port_pids
+  port="$(read_config_value gateway.port)"
+  if [[ -z "${port}" ]]; then
+    port="18789"
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    port_pids="$(lsof -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true)"
+    if [[ -n "${port_pids}" ]]; then
+      while IFS= read -r p; do
+        [[ -z "${p}" ]] && continue
+        local cmdline
+        cmdline="$(ps -o command= -p "${p}" 2>/dev/null || true)"
+        if [[ "${cmdline}" != *openclaw* && "${cmdline}" != *openclaw.mjs* ]]; then
+          continue
+        fi
+        kill "${p}" >/dev/null 2>&1 || true
+        sleep 1
+        if kill -0 "${p}" >/dev/null 2>&1; then
+          kill -9 "${p}" >/dev/null 2>&1 || true
+        fi
+        echo "[stop] stopped port listener pid=${p} (port=${port})"
+        stopped_any=1
+      done <<<"${port_pids}"
+    fi
+  fi
+
+  if [[ "${stopped_any}" != "1" ]]; then
+    echo "[stop] no running background gateway process found"
+  fi
+}
+
 case "${ACTION}" in
   init)
     apply_base_config
@@ -650,6 +1035,17 @@ case "${ACTION}" in
       print_dashboard_hint open
     fi
     oc gateway run
+    ;;
+  run-bg)
+    apply_base_config
+    print_status
+    if [[ "${OPEN_DASHBOARD_ON_RUN}" == "true" ]]; then
+      print_dashboard_hint open
+    fi
+    start_gateway_background
+    ;;
+  stop)
+    stop_gateway_background
     ;;
   dashboard)
     apply_base_config

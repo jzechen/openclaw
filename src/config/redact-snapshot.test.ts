@@ -983,6 +983,72 @@ describe("restoreRedactedValues", () => {
     expect(result.humanReadableMessage).toContain("channels.newChannel.token");
   });
 
+  it("restores wildcard record secrets when key is renamed and source is unambiguous", () => {
+    const hints: ConfigUiHints = {
+      "models.providers.*.apiKey": { sensitive: true },
+    };
+    const incoming = {
+      models: {
+        providers: {
+          custom: {
+            baseUrl: "https://api.example.com/v1",
+            apiKey: REDACTED_SENTINEL,
+            models: [],
+          },
+        },
+      },
+    };
+    const original = {
+      models: {
+        providers: {
+          openai: {
+            baseUrl: "https://api.example.com/v1",
+            apiKey: "sk-original-provider-secret",
+            models: [],
+          },
+        },
+      },
+    };
+    const result = restoreRedactedValues(incoming, original, hints) as typeof incoming;
+    expect(result.models.providers.custom.apiKey).toBe("sk-original-provider-secret");
+  });
+
+  it("keeps wildcard key-rename restore strict when multiple possible secret sources exist", () => {
+    const hints: ConfigUiHints = {
+      "models.providers.*.apiKey": { sensitive: true },
+    };
+    const incoming = {
+      models: {
+        providers: {
+          custom: {
+            baseUrl: "https://api.example.com/v1",
+            apiKey: REDACTED_SENTINEL,
+            models: [],
+          },
+        },
+      },
+    };
+    const original = {
+      models: {
+        providers: {
+          openai: {
+            baseUrl: "https://api.example.com/v1",
+            apiKey: "sk-openai-secret",
+            models: [],
+          },
+          anthropic: {
+            baseUrl: "https://api.anthropic.com/v1",
+            apiKey: "sk-anthropic-secret",
+            models: [],
+          },
+        },
+      },
+    };
+    const result = restoreRedactedValues_orig(incoming, original, hints);
+    expect(result.ok).toBe(false);
+    expect(result.humanReadableMessage).toContain("models.providers.*.apiKey");
+  });
+
   it("keeps unmatched wildcard array entries unchanged outside extension paths", () => {
     const hints: ConfigUiHints = {
       "custom.*": { sensitive: true },

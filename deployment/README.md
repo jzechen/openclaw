@@ -28,6 +28,9 @@ Preloaded config baseline:
 - `deployment/bin/runtime/docs/reference/templates/*`
 - `deployment/build-local-runtime.sh`
 - `deployment/build-local-runtime.ps1`
+- `deployment/build-sea-binary.mjs`
+- `deployment/build-sea-binary.sh`
+- `deployment/build-sea-binary.ps1`
 - `deployment/migrate-local-mac.sh`
 - `deployment/verify-env.sh`
 - `deployment/config/openclaw-mac.json`
@@ -88,9 +91,8 @@ chmod +x deployment/build-local-runtime.sh
 ./deployment/build-local-runtime.sh
 ```
 
-This step compiles current source code, builds Control UI assets, and copies runtime files into `deployment/bin/runtime`.
-It also copies `docs/reference/templates` into `deployment/bin/runtime/docs/reference/templates`.
-It also bundles runtime dependencies into `deployment/bin/runtime/node_modules`.
+This step compiles current source code, builds Control UI assets, and deploys a production runtime into `deployment/bin/runtime`.
+It includes `openclaw.mjs`, `dist`, production `node_modules`, and docs templates.
 It also copies current machine's Node binary into `deployment/bin/node-<os>-<arch>`.
 
 ## Build local runtime (Windows PowerShell)
@@ -104,11 +106,56 @@ This does the same as the shell script and also bundles current Windows Node int
 - `deployment\bin\node-win-x86_64.exe` or
 - `deployment\bin\node-win-arm64.exe`
 
+## Build SEA single-file binary (per-platform)
+
+After building local runtime, you can generate a single-file SEA binary for the current platform.
+For this repo/runtime size, the `--lite` profile is recommended:
+
+```bash
+chmod +x deployment/build-sea-binary.sh
+./deployment/build-sea-binary.sh --lite
+```
+
+Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployment\build-sea-binary.ps1 -Lite
+```
+
+Output naming:
+
+- macOS/Linux: `deployment/bin/openclaw-sea-<os>-<arch>`
+- Windows: `deployment/bin/openclaw-sea-win-<arch>.exe`
+
+Optional: remove `deployment/bin/runtime` after SEA build:
+
+```bash
+./deployment/build-sea-binary.sh --lite --strip-runtime
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployment\build-sea-binary.ps1 -Lite -StripRuntime
+```
+
+`--lite` excludes heavy optional dependencies (`node-llama-cpp`, `sharp`, `@napi-rs/*`, `@img/*`, `playwright-core`) to keep SEA injection stable and binary size manageable. Related features will be unavailable in this mode.
+
 ## macOS
 
 ```bash
 chmod +x deployment/bin/openclaw deployment/usb-openclaw-mac.sh
 ./deployment/usb-openclaw-mac.sh run
+```
+
+Run in background:
+
+```bash
+./deployment/usb-openclaw-mac.sh run-bg
+```
+
+Stop background gateway:
+
+```bash
+./deployment/usb-openclaw-mac.sh stop
 ```
 
 Open dashboard with tokenized URL (recommended for `gateway.auth.mode=token`):
@@ -117,13 +164,13 @@ Open dashboard with tokenized URL (recommended for `gateway.auth.mode=token`):
 ./deployment/usb-openclaw-mac.sh dashboard
 ```
 
-Optional custom root:
+Optional migration source root:
 
 ```bash
 ./deployment/usb-openclaw-mac.sh run ./deployment/data
 ```
 
-Optional custom config root:
+Optional migration source config root:
 
 ```bash
 OPENCLAW_CONFIG_ROOT=./deployment/config ./deployment/usb-openclaw-mac.sh run ./deployment/data
@@ -135,19 +182,37 @@ Run gateway and auto-open dashboard in one command:
 ./deployment/usb-openclaw-mac.sh run ./deployment/data dashboard
 ```
 
+Run gateway in background and auto-open dashboard:
+
+```bash
+./deployment/usb-openclaw-mac.sh run-bg ./deployment/data dashboard
+```
+
 ## Windows Native (No WSL)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Action run
 ```
 
-Optional custom root:
+Run in background:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Action run-bg
+```
+
+Stop background gateway:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Action stop
+```
+
+Optional migration source root:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Action run -UsbRoot "D:\portable-openclaw-data"
 ```
 
-Optional custom config root:
+Optional migration source config root:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Action run -ConfigRoot "D:\portable-openclaw-config"
@@ -165,10 +230,28 @@ Run gateway and auto-open dashboard in one command:
 powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Action run -Dashboard
 ```
 
+Run gateway in background and auto-open dashboard:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Action run-bg -Dashboard
+```
+
 The wrapper defaults to native mode (`-Mode native`). You can also call native script directly:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win-native.ps1 -Action run
+```
+
+Native background run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win-native.ps1 -Action run-bg
+```
+
+Native background stop:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win-native.ps1 -Action stop
 ```
 
 Native direct dashboard:
@@ -183,6 +266,12 @@ powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win-native.ps
 powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Mode wsl -Action run
 ```
 
+Stop background gateway in WSL mode:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployment\usb-openclaw-win.ps1 -Mode wsl -Action stop
+```
+
 ## WSL direct
 
 ```bash
@@ -190,7 +279,13 @@ chmod +x deployment/bin/openclaw deployment/usb-openclaw-wsl.sh
 ./deployment/usb-openclaw-wsl.sh run
 ```
 
-Optional custom config root:
+Stop background gateway:
+
+```bash
+./deployment/usb-openclaw-wsl.sh stop
+```
+
+Optional migration source config root:
 
 ```bash
 OPENCLAW_CONFIG_ROOT=./deployment/config ./deployment/usb-openclaw-wsl.sh run ./deployment/data
@@ -231,8 +326,12 @@ CODEX_HOME=./deployment/data/codex-home \
 
 ## Notes
 
-- Scripts default to `deployment/config` for config and `deployment/data` for state/workspace.
-- Scripts set `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH`, and `CODEX_HOME` automatically.
+- Scripts treat `deployment/config` and `deployment/data` as migration sources.
+- On startup, scripts migrate available config/state/workspace/codex-home into the default OpenClaw home (`~/.openclaw` or `%USERPROFILE%\.openclaw`) and default Codex home (`~/.codex` or `%USERPROFILE%\.codex`).
+- Scripts then run against the default paths (`openclaw.json` under default OpenClaw home) so CLI/app share one environment instead of isolated deployment-only state.
+- Scripts still set `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH`, and `CODEX_HOME` to those default locations for explicitness.
+- Scripts prepend `deployment/bin` to `PATH` for the current process and child processes, so `openclaw`/`openclaw.cmd` can be resolved by name during startup.
+- `deployment/bin/openclaw` and `deployment/bin/openclaw.cmd` will prefer `openclaw-sea-*` automatically when present; otherwise they fall back to `node + runtime` mode.
 - Scripts run `openclaw setup --workspace <resolved-workspace>` on startup to ensure bootstrap files exist (`AGENTS.md`, `SOUL.md`, `USER.md`, etc.) without overwriting existing files.
 - If both `MEMORY.md` and `memory.md` are absent, scripts create a starter `MEMORY.md`.
 - If `gateway.auth.token` is missing, scripts auto-generate one.

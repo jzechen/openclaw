@@ -165,7 +165,6 @@ if ($NodeCommand) {
   if ($Arch) {
     $TargetNode = Join-Path $BinDir "node-win-$Arch.exe"
     Copy-Item -Path $NodeCommand.Source -Destination $TargetNode -Force
-    Copy-Item -Path $NodeCommand.Source -Destination (Join-Path $RuntimeDir "node-win-$Arch.exe") -Force
     Write-Host "[build] bundled node: $TargetNode"
   }
 }

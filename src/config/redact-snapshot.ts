@@ -475,6 +475,21 @@ function restoreOriginalValueOrThrow(params: {
   throw new RedactionError(params.path);
 }
 
+function resolveWildcardOriginalObjectFallback(
+  original: Record<string, unknown>,
+  key: string,
+): unknown {
+  if (key in original) {
+    return original[key];
+  }
+  const objectValues = Object.values(original).filter(
+    (value) => value && typeof value === "object" && !Array.isArray(value),
+  );
+  // Support key renames for wildcard records during redaction round-trips:
+  // if there's exactly one existing sibling object, treat it as the source.
+  return objectValues.length === 1 ? objectValues[0] : undefined;
+}
+
 function mapRedactedArray(params: {
   incoming: unknown[];
   original: unknown;
@@ -627,7 +642,16 @@ function restoreRedactedValuesWithLookup(
         if (value === REDACTED_SENTINEL) {
           result[key] = restoreOriginalValueOrThrow({ key, path: candidate, original: orig });
         } else if (typeof value === "object" && value !== null) {
-          result[key] = restoreRedactedValuesWithLookup(value, orig[key], lookup, candidate, hints);
+          const wildcardOriginalFallback = candidate.endsWith(".*")
+            ? resolveWildcardOriginalObjectFallback(orig, key)
+            : undefined;
+          result[key] = restoreRedactedValuesWithLookup(
+            value,
+            wildcardOriginalFallback ?? orig[key],
+            lookup,
+            candidate,
+            hints,
+          );
         }
         break;
       }

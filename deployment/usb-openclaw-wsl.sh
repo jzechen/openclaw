@@ -13,18 +13,31 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ACTION="${1:-run}"
 DEFAULT_ROOT="${SCRIPT_DIR}/data"
 USB_ROOT_INPUT="${2:-${OPENCLAW_USB_ROOT:-${DEFAULT_ROOT}}}"
+EXTRA_ARG="${3:-}"
+OPEN_DASHBOARD_ON_RUN=false
 CONFIG_ROOT_INPUT="${OPENCLAW_CONFIG_ROOT:-${SCRIPT_DIR}/config}"
 
 usage() {
   cat <<'USAGE'
 Usage:
-  usb-openclaw-wsl.sh <init|run|status> [data_root_path]
+  usb-openclaw-wsl.sh <init|run|run-bg|stop|status> [data_root_path] [dashboard]
 
 Examples:
   ./deployment/usb-openclaw-wsl.sh init
   ./deployment/usb-openclaw-wsl.sh run
+  ./deployment/usb-openclaw-wsl.sh run-bg
+  ./deployment/usb-openclaw-wsl.sh stop
 USAGE
 }
+
+if [[ "${ACTION}" == "run" || "${ACTION}" == "run-bg" ]]; then
+  if [[ "${USB_ROOT_INPUT}" == "dashboard" ]]; then
+    USB_ROOT_INPUT="${OPENCLAW_USB_ROOT:-${DEFAULT_ROOT}}"
+    OPEN_DASHBOARD_ON_RUN=true
+  elif [[ "${EXTRA_ARG}" == "dashboard" ]]; then
+    OPEN_DASHBOARD_ON_RUN=true
+  fi
+fi
 
 mkdir -p "${USB_ROOT_INPUT}"
 USB_ROOT="$(cd "${USB_ROOT_INPUT}" && pwd)"
@@ -104,8 +117,11 @@ ensure_gateway_token() {
   if [[ "${has_token}" != "1" ]]; then
     local token
     token="$(generate_token)"
-    oc config set gateway.auth.token "${token}" >/dev/null
-    echo "[init] generated gateway.auth.token in ${CONFIG_PATH}"
+    if oc config set gateway.auth.token "${token}" >/dev/null 2>&1; then
+      echo "[init] generated gateway.auth.token in ${CONFIG_PATH}"
+    else
+      echo "[warn] failed to generate gateway.auth.token automatically"
+    fi
   fi
   local resolved_token
   resolved_token="$(read_gateway_token)"
@@ -134,7 +150,105 @@ set_config_default() {
   local present
   present="$(config_value_present "${key}")"
   if [[ "${present}" != "1" ]]; then
-    oc config set "${key}" "${value}" >/dev/null
+    if ! oc config set "${key}" "${value}" >/dev/null 2>&1; then
+      echo "[warn] failed to set default config '${key}' (config may still be invalid)"
+    fi
+  fi
+}
+
+remove_config_key_path() {
+  local key_path="$1"
+  node_eval '
+const fs=require("fs");
+const configPath=process.argv[1];
+const keyPath=process.argv[2];
+if (!configPath || !keyPath) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+let cfg;
+try {
+  cfg=JSON.parse(fs.readFileSync(configPath,"utf8"));
+} catch {
+  process.stdout.write("0");
+  process.exit(0);
+}
+const parts=keyPath.split(".").filter(Boolean);
+if (parts.length === 0) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+let obj=cfg;
+for (let i=0;i<parts.length-1;i++) {
+  const part=parts[i];
+  if (!obj || typeof obj !== "object" || !(part in obj)) {
+    process.stdout.write("0");
+    process.exit(0);
+  }
+  obj=obj[part];
+}
+const leaf=parts[parts.length-1];
+if (!obj || typeof obj !== "object" || !(leaf in obj)) {
+  process.stdout.write("0");
+  process.exit(0);
+}
+delete obj[leaf];
+fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n");
+process.stdout.write("1");
+' "${CONFIG_PATH}" "${key_path}"
+}
+
+cleanup_known_invalid_config_keys() {
+  local raw normalized paths
+  raw="$(oc config validate 2>&1 || true)"
+  normalized="${raw//\\n/$'\n'}"
+  paths="$(printf '%s\n' "${normalized}" | awk '
+/(unknown channel id:|plugin not found:)/ {
+  line=$0
+  sub(/^[[:space:]]*[×-]?[[:space:]]*/, "", line)
+  sub(/:.*/, "", line)
+  if (line != "") print line
+}
+' | sort -u)"
+  if [[ -z "${paths}" ]]; then
+    return
+  fi
+
+  local path removed_any
+  removed_any=0
+  while IFS= read -r path; do
+    [[ -z "${path}" ]] && continue
+    if [[ "$(remove_config_key_path "${path}")" == "1" ]]; then
+      echo "[init] removed invalid config key: ${path}"
+      removed_any=1
+    fi
+  done <<<"${paths}"
+
+  if [[ "${removed_any}" == "1" ]]; then
+    echo "[init] applied invalid-config cleanup from validate output"
+  fi
+}
+
+ensure_valid_config_for_startup() {
+  if oc config validate >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "[init] detected invalid config; running non-interactive doctor repair..."
+  if ! oc doctor --non-interactive --fix --yes >/dev/null 2>&1; then
+    echo "[warn] automatic doctor repair failed; continuing with best-effort startup."
+  fi
+
+  if oc config validate >/dev/null 2>&1; then
+    echo "[init] config repaired by doctor --fix"
+    return
+  fi
+
+  cleanup_known_invalid_config_keys
+  if oc config validate >/dev/null 2>&1; then
+    echo "[init] config repaired by key cleanup fallback"
+  else
+    echo "[warn] config still invalid after doctor --fix; continuing with best-effort startup."
   fi
 }
 
@@ -150,6 +264,7 @@ print_config_value() {
 }
 
 apply_base_config() {
+  #ensure_valid_config_for_startup
   set_config_default gateway.mode local
   set_config_default gateway.port 18789
   set_config_default gateway.bind loopback
@@ -173,6 +288,79 @@ print_status() {
   print_config_value agents.defaults.model.primary
 }
 
+print_dashboard_hint() {
+  local mode="${1:-no-open}"
+  echo "[hint] Open dashboard with tokenized URL:"
+  local output url
+  output="$(oc dashboard --no-open 2>&1 || true)"
+  printf '%s\n' "${output}"
+  url="$(printf '%s\n' "${output}" | sed -n 's/^Dashboard URL: //p' | head -n 1)"
+  if [[ "${mode}" == "open" && -n "${url}" ]]; then
+    if command -v xdg-open >/dev/null 2>&1; then
+      if xdg-open "${url}" >/dev/null 2>&1; then
+        echo "Opened in your browser. Keep that tab to control OpenClaw."
+      else
+        echo "[warn] Browser auto-open failed. Use the URL above."
+      fi
+    else
+      echo "[warn] Browser auto-open is not available. Use the URL above."
+    fi
+  fi
+}
+
+start_gateway_background() {
+  local log_dir log_file pid_file
+  log_dir="${STATE_DIR}/logs"
+  log_file="${log_dir}/gateway.log"
+  pid_file="${STATE_DIR}/gateway.pid"
+  mkdir -p "${log_dir}"
+  nohup "${LOCAL_OPENCLAW}" gateway run >"${log_file}" 2>&1 &
+  echo $! >"${pid_file}"
+  echo "[run-bg] gateway started in background (pid=$(cat "${pid_file}"))"
+  echo "[run-bg] log: ${log_file}"
+}
+
+stop_gateway_background() {
+  local pid_file
+  pid_file="${STATE_DIR}/gateway.pid"
+  local stopped_any=0
+
+  if [[ -f "${pid_file}" ]]; then
+    local pid
+    pid="$(cat "${pid_file}" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1; then
+      kill "${pid}" >/dev/null 2>&1 || true
+      sleep 1
+      if kill -0 "${pid}" >/dev/null 2>&1; then
+        kill -9 "${pid}" >/dev/null 2>&1 || true
+      fi
+      echo "[stop] stopped gateway pid=${pid}"
+      stopped_any=1
+    fi
+    rm -f "${pid_file}"
+  fi
+
+  # Fallback: stop orphaned background runs not tracked by pid file.
+  local pids
+  pids="$(pgrep -f "${LOCAL_OPENCLAW} gateway run" || true)"
+  if [[ -n "${pids}" ]]; then
+    while IFS= read -r p; do
+      [[ -z "${p}" ]] && continue
+      kill "${p}" >/dev/null 2>&1 || true
+      sleep 1
+      if kill -0 "${p}" >/dev/null 2>&1; then
+        kill -9 "${p}" >/dev/null 2>&1 || true
+      fi
+      echo "[stop] stopped orphan gateway pid=${p}"
+      stopped_any=1
+    done <<<"${pids}"
+  fi
+
+  if [[ "${stopped_any}" != "1" ]]; then
+    echo "[stop] no running background gateway process found"
+  fi
+}
+
 case "${ACTION}" in
   init)
     apply_base_config
@@ -181,7 +369,21 @@ case "${ACTION}" in
   run)
     apply_base_config
     print_status
+    if [[ "${OPEN_DASHBOARD_ON_RUN}" == "true" ]]; then
+      print_dashboard_hint open
+    fi
     oc gateway run
+    ;;
+  run-bg)
+    apply_base_config
+    print_status
+    if [[ "${OPEN_DASHBOARD_ON_RUN}" == "true" ]]; then
+      print_dashboard_hint open
+    fi
+    start_gateway_background
+    ;;
+  stop)
+    stop_gateway_background
     ;;
   status)
     print_status
